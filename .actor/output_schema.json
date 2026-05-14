@@ -1,7 +1,11 @@
 {
-	"actorSpecification": 1,
-	"title": "Momondo Flight Scraper Output",
-	"description": "Flight search results from Momondo including legs, segments, and booking options.",
-	"type": "object",
-	"$ref": "./dataset_schema.json"
+	"actorOutputSchemaVersion": 1,
+	"title": "Output schema of Momondo Flight Scraper",
+	"properties": {
+		"results": {
+			"type": "string",
+			"title": "Results",
+			"template": "{{links.apiDefaultDatasetUrl}}/items"
+		}
+	}
 }
