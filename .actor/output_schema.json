@@ -1,0 +1,7 @@
+{
+	"actorSpecification": 1,
+	"title": "Momondo Flight Scraper Output",
+	"description": "Flight search results from Momondo including legs, segments, and booking options.",
+	"type": "object",
+	"$ref": "./dataset_schema.json"
+}

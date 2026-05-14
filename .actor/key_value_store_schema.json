@@ -1,0 +1,27 @@
+{
+	"actorSpecification": 1,
+	"storeDefinition": {
+		"storeName": "keyValueStoreName",
+		"description": "Key-value store for Momondo Flight Scraper",
+		"accessLevel": "UNKNOWN",
+		"fields": {
+			"INPUT": {
+				"title": "INPUT",
+				"description": "Actor input JSON",
+				"example": {
+					"tripType": "one-way",
+					"origin": "JFK",
+					"destination": "LHR",
+					"departureDate": "2026-08-01",
+					"adults": 1,
+					"children": 0,
+					"infants": 0,
+					"cabinClass": "ECONOMY",
+					"currency": "USD",
+					"maxStops": null,
+					"maxResults": 50
+				}
+			}
+		}
+	}
+}

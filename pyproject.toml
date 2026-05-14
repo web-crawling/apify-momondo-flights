@@ -1,0 +1,17 @@
+[project]
+name = "momondo-flights"
+version = "1.0.0"
+description = "Apify actor for scraping flight search results from Momondo."
+requires-python = ">=3.12"
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "D", "ARG"]
+ignore = ["D100", "D101", "D102", "D103", "D104", "D105", "D107", "D203", "D213"]
+
+[tool.pytest.ini_options]
+markers = [
+    "live: marks tests as live network tests (require internet connection to momondo.com)",
+]

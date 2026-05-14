@@ -1,0 +1,144 @@
+{
+	"title": "Momondo Flight Scraper Input",
+	"description": "Search and scrape flight results from Momondo across multiple search modes.",
+	"type": "object",
+	"schemaVersion": 1,
+	"properties": {
+		"tripType": {
+			"title": "Trip Type",
+			"type": "string",
+			"editor": "select",
+			"enum": ["one-way", "round-trip", "multi-city", "flexible"],
+			"default": "one-way",
+			"description": "Search mode: 'one-way' for single leg, 'round-trip' for outbound + return, 'multi-city' for multiple stops, 'flexible' for date range search (±N days)."
+		},
+		"origin": {
+			"title": "Departure Airport",
+			"type": "string",
+			"editor": "textfield",
+			"default": "JFK",
+			"description": "3-letter IATA airport code of the departure airport (e.g., JFK, LHR, CDG).",
+			"sectionCaption": "Route"
+		},
+		"destination": {
+			"title": "Arrival Airport",
+			"type": "string",
+			"editor": "textfield",
+			"default": "LHR",
+			"description": "3-letter IATA airport code of the destination airport (e.g., LHR, BKK, NRT).",
+			"sectionCaption": "Route"
+		},
+		"departureDate": {
+			"title": "Departure Date",
+			"type": "string",
+			"format": "date",
+			"default": "2026-08-01",
+			"description": "Departure date in YYYY-MM-DD format. Must be today or in the future.",
+			"sectionCaption": "Route"
+		},
+		"returnDate": {
+			"title": "Return Date",
+			"type": ["string", "null"],
+			"format": "date",
+			"default": null,
+			"description": "Return date in YYYY-MM-DD format. Required when Trip Type is 'round-trip'; ignored for other modes.",
+			"sectionCaption": "Route"
+		},
+		"departureDateFlexDays": {
+			"title": "Flexible Date Range (days)",
+			"type": ["integer", "null"],
+			"editor": "number",
+			"default": null,
+			"minimum": 1,
+			"maximum": 7,
+			"description": "Number of days around the departure date to search (e.g., 3 = ±3 days). Used only when Trip Type is 'flexible'.",
+			"sectionCaption": "Route"
+		},
+		"legs": {
+			"title": "Multi-City Legs",
+			"type": "array",
+			"editor": "json",
+			"description": "Array of flight legs for multi-city trips. Each leg: {origin: string (IATA), destination: string (IATA), departureDate: string (YYYY-MM-DD)}. Minimum 2 legs required. Used only when Trip Type is 'multi-city'.",
+			"prefill": [
+				{"origin": "JFK", "destination": "LHR", "departureDate": "2026-08-01"},
+				{"origin": "LHR", "destination": "CDG", "departureDate": "2026-08-08"}
+			],
+			"sectionCaption": "Multi-City Legs"
+		},
+		"adults": {
+			"title": "Adults",
+			"type": "integer",
+			"editor": "number",
+			"default": 1,
+			"minimum": 1,
+			"maximum": 9,
+			"description": "Number of adult passengers (18+).",
+			"sectionCaption": "Passengers"
+		},
+		"children": {
+			"title": "Children",
+			"type": "integer",
+			"editor": "number",
+			"default": 0,
+			"minimum": 0,
+			"maximum": 8,
+			"description": "Number of child passengers (2–17 years).",
+			"sectionCaption": "Passengers"
+		},
+		"infants": {
+			"title": "Infants",
+			"type": "integer",
+			"editor": "number",
+			"default": 0,
+			"minimum": 0,
+			"maximum": 4,
+			"description": "Number of infant passengers (under 2 years, lap-held).",
+			"sectionCaption": "Passengers"
+		},
+		"cabinClass": {
+			"title": "Cabin Class",
+			"type": "string",
+			"editor": "select",
+			"enum": ["ECONOMY", "PREMIUM_ECONOMY", "BUSINESS", "FIRST"],
+			"default": "ECONOMY",
+			"description": "Cabin class filter.",
+			"sectionCaption": "Search Options"
+		},
+		"currency": {
+			"title": "Currency",
+			"type": "string",
+			"editor": "textfield",
+			"default": "USD",
+			"description": "ISO 4217 currency code for returned prices (e.g., USD, EUR, GBP).",
+			"sectionCaption": "Search Options"
+		},
+		"maxStops": {
+			"title": "Maximum Stops",
+			"type": ["integer", "null"],
+			"editor": "number",
+			"default": null,
+			"minimum": 0,
+			"maximum": 3,
+			"description": "Maximum number of stops. 0 = nonstop only, 1 = max 1 stop, etc. Leave empty for no restriction.",
+			"sectionCaption": "Search Options"
+		},
+		"maxResults": {
+			"title": "Max Results",
+			"type": "integer",
+			"editor": "number",
+			"default": 50,
+			"minimum": 1,
+			"maximum": 500,
+			"description": "Maximum number of flight results to return across all pages.",
+			"sectionCaption": "Search Options"
+		},
+		"proxyConfiguration": {
+			"title": "Proxy Configuration",
+			"type": "object",
+			"editor": "proxy",
+			"default": null,
+			"description": "Apify proxy configuration. By default the actor runs without proxy (direct datacenter requests work on Momondo as of v1). Only configure this if you encounter HTTP 401/429/403 errors.",
+			"sectionCaption": "Advanced"
+		}
+	}
+}
