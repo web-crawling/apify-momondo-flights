@@ -622,6 +622,55 @@ def test_parse_poll_captures_searchid():
     print('\n[PASS] parse_poll captures searchId from first response and threads it to retry request')
 
 
+def test_crawl_failed_class_attribute_observable_from_outside():
+    """BLOCKER fix (main.py): crawl_failed set inside spider must be readable via
+    MomondoSpider.crawl_failed AFTER the spider exits (CrawlerRunner.crawl() returns
+    None, not the spider instance, so getattr(spider, ...) always sees None and falls
+    back to the default — the class attribute is the only reliable read path).
+    """
+    try:
+        from src.spiders.momondo import MomondoSpider
+    except ImportError:
+        pytest.skip('Scrapy not installed — skipping unit import test')
+
+    # Start clean
+    MomondoSpider.crawl_failed = False
+    MomondoSpider.auth_failed = False
+
+    spider = MomondoSpider(trip_type='one-way', origin='JFK', destination='LHR',
+                           departure_date='2026-09-01')
+
+    # Simulate what the spider does on a 403 error (type(self).crawl_failed = True)
+    type(spider).crawl_failed = True
+
+    # main.py reads the class attribute AFTER the deferred resolves, where it only
+    # has the class reference (not the instance).  Verify the mutation is visible.
+    assert MomondoSpider.crawl_failed is True, (
+        'MomondoSpider.crawl_failed should be True after type(self).crawl_failed = True '
+        'inside the spider — the class attribute must reflect the spider-set value'
+    )
+
+    # Also verify auth_failed works the same way
+    assert MomondoSpider.auth_failed is False
+    type(spider).auth_failed = True
+    assert MomondoSpider.auth_failed is True, (
+        'MomondoSpider.auth_failed should be True after type(self).auth_failed = True'
+    )
+
+    # Verify __init__ resets both to False for the next run
+    spider2 = MomondoSpider(trip_type='one-way', origin='JFK', destination='LHR',
+                            departure_date='2026-09-01')
+    assert MomondoSpider.crawl_failed is False, (
+        '__init__ must reset crawl_failed=False via type(self) for the next run'
+    )
+    assert MomondoSpider.auth_failed is False, (
+        '__init__ must reset auth_failed=False via type(self) for the next run'
+    )
+
+    print('\n[PASS] crawl_failed/auth_failed class-attribute pattern: set inside spider, '
+          'readable via MomondoSpider.X from outside, reset by __init__')
+
+
 def test_crawl_failed_set_on_4xx():
     """BLOCKER fix #8 / issue #6: crawl_failed must be set to True when poll returns 4xx."""
     try:

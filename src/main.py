@@ -255,7 +255,7 @@ async def main() -> None:
         # the spider closed with 0 items despite seeing results in filteredCount.
         # Without this check, Scrapy exits cleanly (SUCCEEDED with 0 items) and the
         # failure is invisible on the Apify platform.
-        if getattr(spider, 'crawl_failed', False):
+        if MomondoSpider.crawl_failed:
             await Actor.fail(
                 status_message=(
                     'Spider crawl failed. The poll request was rejected by Momondo '

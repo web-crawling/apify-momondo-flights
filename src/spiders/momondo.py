@@ -139,8 +139,12 @@ def _cabin_matches(cabin_display: str, requested_class: str) -> bool:
 class MomondoSpider(scrapy.Spider):
     name = 'momondo'
 
-    # Set by main.py before crawl; checked after deferred resolves.
+    # Class-level flags: reset by main.py before each crawl; mutated via
+    # type(self).attr = True inside the spider so that main.py can read the
+    # current value after the Deferred resolves (CrawlerRunner.crawl() returns
+    # None, not the spider instance, so instance attribute reads are impossible).
     auth_failed: bool = False
+    crawl_failed: bool = False
 
     def __init__(
         self,
@@ -184,8 +188,10 @@ class MomondoSpider(scrapy.Spider):
         self._session_refreshed: bool = False
         self.items_yielded: int = 0
         self.skipped_filtered: int = 0  # results dropped by client-side cabin/stops filters
-        self.auth_failed: bool = False
-        self.crawl_failed: bool = False
+        # Reset class-level flags so a new spider instance in the same process
+        # starts clean (class attributes persist between runs otherwise).
+        type(self).auth_failed = False
+        type(self).crawl_failed = False
         self.observed_filtered_count: int = 0  # highest filteredCount seen across all poll responses
 
         # Validate: flexible mode requires departureDateFlexDays.
@@ -553,7 +559,7 @@ class MomondoSpider(scrapy.Spider):
                 'HTTP 403 on poll. Momondo may be blocking datacenter IPs. '
                 'Consider enabling proxyConfiguration in actor input.'
             )
-            self.crawl_failed = True
+            type(self).crawl_failed = True
             return
 
         if response.status != 200:
@@ -561,7 +567,7 @@ class MomondoSpider(scrapy.Spider):
                 'Unexpected status %d on poll (page=%d). Skipping page.',
                 response.status, page,
             )
-            self.crawl_failed = True
+            type(self).crawl_failed = True
             return
 
         # --- Extract CSRF token from Set-Cookie (once per session) ---
@@ -720,7 +726,7 @@ class MomondoSpider(scrapy.Spider):
             logger.error(
                 'HTTP 401 persists after session refresh. Closing spider as auth_failed.'
             )
-            self.auth_failed = True
+            type(self).auth_failed = True
             raise CloseSpider('auth_failed')
 
         logger.warning(
@@ -792,7 +798,7 @@ class MomondoSpider(scrapy.Spider):
                     'The request will be retried when parse_poll handles it (if HttpErrorMiddleware '
                     'passes it through). Marking crawl_failed.'
                 )
-                self.crawl_failed = True
+                type(self).crawl_failed = True
             elif 400 <= status < 500:
                 try:
                     body_preview = response.text[:500]
@@ -803,15 +809,15 @@ class MomondoSpider(scrapy.Spider):
                     'Body preview: %s. Setting crawl_failed=True.',
                     status, body_preview,
                 )
-                self.crawl_failed = True
+                type(self).crawl_failed = True
             else:
                 logger.error(
                     'HTTP %d on poll request. Setting crawl_failed=True.', status
                 )
-                self.crawl_failed = True
+                type(self).crawl_failed = True
         else:
             logger.error('Poll request failed with network error: %s', failure)
-            self.crawl_failed = True
+            type(self).crawl_failed = True
 
     def closed(self, reason: str) -> None:
         """Spider closed hook: detect silent failure (0 items despite seeing filteredCount > 0)."""
@@ -825,7 +831,7 @@ class MomondoSpider(scrapy.Spider):
                 'one response. Results existed but were not extracted — marking crawl_failed=True.',
                 self.observed_filtered_count,
             )
-            self.crawl_failed = True
+            type(self).crawl_failed = True
 
     # ------------------------------------------------------------------
     # Step 4 — parse_result stub (parser-implementer fills this in)
