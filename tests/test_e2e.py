@@ -410,24 +410,23 @@ def test_result_without_legs_is_skipped(spider, poll_data):
 def test_live_one_way_search():
     """Live one-way search: bootstrap -> poll -> parse_result -> at least 1 FlightItem.
 
-    NOTE: This test currently FAILS due to BLOCKER bug:
-    cabinClass and currency in userSearchParams cause HTTP 400 from Momondo API.
-    The spider's poll request fails before parse_result is called.
-
-    Tracking: see test_e2e.py comments and QA report.
+    NOTE: The underlying BLOCKER (cabinClass/currency in poll body → HTTP 400) was
+    fixed in fix/dynamic-searchid. This stub can be replaced with a real spider
+    run in a future QA pass. Skipped pending full implementation.
     """
     pytest.skip(
-        'BLOCKER: Spider poll body contains cabinClass/currency in userSearchParams '
-        'which Momondo rejects with HTTP 400. All items_yielded=0. '
-        'Fix required in src/spiders/momondo.py _build_poll_body().'
+        'Stub — the cabinClass/currency BLOCKER was fixed in fix/dynamic-searchid. '
+        'Full end-to-end spider live test not yet implemented here; use `python -m src` instead.'
     )
 
 
 @pytest.mark.live
 def test_live_minimal_poll_returns_results():
-    """Live test: a minimal poll body (no cabinClass/currency) returns 200 with results.
+    """Live test: a minimal poll body (no cabinClass/currency/searchId on first poll) returns 200.
 
     This confirms the API works and parse_result can process results when the body is correct.
+    Per fix for issue #8: the first poll OMITS searchId; the server returns a fresh searchId
+    in the response which must be used for subsequent pages.
     """
     import re as re_mod
     import requests
@@ -454,13 +453,13 @@ def test_live_minimal_poll_returns_results():
     assert match, 'formToken not found'
     form_token = match.group(1)
 
+    # First poll: omit searchId — server issues a fresh one in the response.
     poll_body = {
         'filterParams': {},
         'userSearchParams': {
             'legs': [{'origin': {'airports': ['JFK'], 'locationType': 'airports'},
                       'destination': {'airports': ['LHR'], 'locationType': 'airports'},
                       'date': '2026-08-01', 'flex': 'exact'}],
-            'searchId': 'saECWKdkIP',
             'passengers': ['ADT'],
             'passengerDetails': [{'ptc': 'ADT'}],
             'sortMode': 'bestflight_a',
@@ -486,7 +485,12 @@ def test_live_minimal_poll_returns_results():
     data = poll_resp.json()
     results = data.get('results', [])
     assert len(results) > 0, 'No results in poll response'
-    print(f'\n[INFO] Live minimal poll: {len(results)} results, filteredCount={data.get("filteredCount")}')
+
+    # Verify server-issued searchId is present (dynamic searchId — fix for issue #8)
+    server_search_id = data.get('searchId')
+    assert server_search_id, f'Server did not return a searchId in poll response; keys={list(data.keys())}'
+    print(f'\n[INFO] Live minimal poll: {len(results)} results, filteredCount={data.get("filteredCount")}, '
+          f'server_searchId={server_search_id!r}')
 
     # Now run parse_result on the live results
     MomondoSpider = _import_spider()
