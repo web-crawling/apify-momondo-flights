@@ -33,10 +33,12 @@ Authentication (CSRF):
     and raise CloseSpider('auth_failed').
 
 searchId:
-  - The poll API validates the searchId against a known pattern.
-  - Empirically confirmed: 'saECWKdkIP' is accepted universally across all
-    routes, dates, and session tokens.
-  - This constant is used; the server generates its own viewId per response.
+  - searchId is server-issued, NOT a client constant.
+  - The FIRST poll for each session omits searchId from userSearchParams.
+  - The server returns a fresh searchId in the first poll response (response["searchId"]).
+  - All subsequent polls in the same session (page 2+) include the server-returned searchId.
+  - For flexible date fan-out, each date variant is its own session with its own searchId.
+    The searchId is threaded per-session through cb_kwargs.
 
 Poll API field restrictions (QA confirmed 2026-05-14):
   - cabinClass, currency, and stops/maxStops are NOT accepted in the poll body.
@@ -80,10 +82,9 @@ PTC_ADULT = 'ADT'
 PTC_CHILD = 'CNN'
 PTC_INFANT = 'INF'
 
-# Empirically confirmed universal searchId accepted by the poll API.
-# Momondo validates searchId format server-side; random strings are rejected (400).
-# This constant works across all routes, dates, and session tokens.
-VALID_SEARCH_ID = 'saECWKdkIP'
+# Maximum retries when first poll returns filteredCount > 0 but 0 results
+# (server-side search still initialising; long-polling style).
+_EMPTY_FIRST_PAGE_MAX_RETRIES = 3
 
 # Cabin class client-side filter (QA-confirmed 2026-05-14):
 # cabinClass is NOT accepted in the Momondo poll body (HTTP 400 VALIDATION_ERROR).
@@ -138,8 +139,12 @@ def _cabin_matches(cabin_display: str, requested_class: str) -> bool:
 class MomondoSpider(scrapy.Spider):
     name = 'momondo'
 
-    # Set by main.py before crawl; checked after deferred resolves.
+    # Class-level flags: reset by main.py before each crawl; mutated via
+    # type(self).attr = True inside the spider so that main.py can read the
+    # current value after the Deferred resolves (CrawlerRunner.crawl() returns
+    # None, not the spider instance, so instance attribute reads are impossible).
     auth_failed: bool = False
+    crawl_failed: bool = False
 
     def __init__(
         self,
@@ -183,7 +188,11 @@ class MomondoSpider(scrapy.Spider):
         self._session_refreshed: bool = False
         self.items_yielded: int = 0
         self.skipped_filtered: int = 0  # results dropped by client-side cabin/stops filters
-        self.auth_failed: bool = False
+        # Reset class-level flags so a new spider instance in the same process
+        # starts clean (class attributes persist between runs otherwise).
+        type(self).auth_failed = False
+        type(self).crawl_failed = False
+        self.observed_filtered_count: int = 0  # highest filteredCount seen across all poll responses
 
         # Validate: flexible mode requires departureDateFlexDays.
         if self.trip_type == 'flexible' and not self.departure_date_flex_days:
@@ -423,7 +432,7 @@ class MomondoSpider(scrapy.Spider):
         """
         return {}
 
-    def _build_poll_body(self, legs: list[dict], page: int) -> dict:
+    def _build_poll_body(self, legs: list[dict], page: int, search_id: str | None = None) -> dict:
         """Construct the full poll request body.
 
         QA-confirmed 2026-05-14: the following fields are NOT accepted by
@@ -431,16 +440,26 @@ class MomondoSpider(scrapy.Spider):
           - userSearchParams.cabinClass  (filtered client-side in parse_result)
           - userSearchParams.currency    (attempted via bootstrap cookie instead)
           - filterParams.stops           (filtered client-side in parse_result)
+
+        searchId handling (fix for issue #8):
+          - On the FIRST poll for a session (page 1, no prior searchId), omit searchId
+            entirely from userSearchParams. The server issues a fresh searchId in the response.
+          - On subsequent polls (page 2+, or page-1 retry), include the server-returned searchId.
+          - search_id=None means "first poll" and omits the key.
         """
         passengers, passenger_details = self._build_passengers()
 
         user_search_params: dict = {
             'legs': legs,
-            'searchId': VALID_SEARCH_ID,
             'passengers': passengers,
             'passengerDetails': passenger_details,
             'sortMode': 'bestflight_a',
         }
+
+        # Only include searchId when we have a server-issued one.
+        # The first poll must omit it; the server returns a fresh searchId in that response.
+        if search_id is not None:
+            user_search_params['searchId'] = search_id
 
         return {
             'filterParams': self._build_filter_params(),
@@ -457,20 +476,32 @@ class MomondoSpider(scrapy.Spider):
         legs: list[dict],
         page: int,
         flex_date: str | None = None,
+        search_id: str | None = None,
         cb_kwargs: dict | None = None,
+        page1_retry_count: int = 0,
     ) -> Request:
         """Create a single poll POST Request object.
 
         Args:
-            legs:       Legs array for the body.
-            page:       pageNumber (1-indexed).
-            flex_date:  For flexible fan-out — the specific departure date this
-                        request covers (passed through cb_kwargs for tracing).
-            cb_kwargs:  Additional cb_kwargs to merge (e.g. for retry context).
+            legs:              Legs array for the body.
+            page:              pageNumber (1-indexed).
+            flex_date:         For flexible fan-out — the specific departure date this
+                               request covers (passed through cb_kwargs for tracing).
+            search_id:         Server-issued searchId for this session. None on first poll
+                               (server returns the ID in response); reused on subsequent polls.
+            cb_kwargs:         Additional cb_kwargs to merge (e.g. for retry context).
+            page1_retry_count: Number of page-1 retries already done for this session
+                               (for the empty-first-page long-polling pattern).
         """
-        body = self._build_poll_body(legs=legs, page=page)
+        body = self._build_poll_body(legs=legs, page=page, search_id=search_id)
         extra_kwargs = dict(cb_kwargs or {})
-        extra_kwargs.update({'legs': legs, 'page': page, 'flex_date': flex_date})
+        extra_kwargs.update({
+            'legs': legs,
+            'page': page,
+            'flex_date': flex_date,
+            'search_id': search_id,
+            'page1_retry_count': page1_retry_count,
+        })
 
         return scrapy.Request(
             url=POLL_URL,
@@ -497,18 +528,22 @@ class MomondoSpider(scrapy.Spider):
         legs: list[dict],
         page: int,
         flex_date: str | None = None,
+        search_id: str | None = None,
+        page1_retry_count: int = 0,
         **kwargs: Any,
     ) -> Generator[Any, None, None]:
         """Handle a poll response.
 
-        1. Extract CSRF token from Set-Cookie (on first response only).
-        2. Handle non-200 status codes.
-        3. Yield each result to parse_result().
-        4. Fire next-page request if pagination continues.
+        1. Handle non-200 status codes.
+        2. Capture server-issued searchId from first response.
+        3. Long-poll retry if first page returns 0 results but filteredCount > 0.
+        4. Yield each result to parse_result().
+        5. Fire next-page request if pagination continues.
         """
         # --- Handle non-200 status codes ---
         if response.status == 401:
-            yield from self._handle_401(response, legs=legs, page=page, flex_date=flex_date)
+            yield from self._handle_401(response, legs=legs, page=page, flex_date=flex_date,
+                                        search_id=search_id)
             return
 
         if response.status == 429:
@@ -524,6 +559,7 @@ class MomondoSpider(scrapy.Spider):
                 'HTTP 403 on poll. Momondo may be blocking datacenter IPs. '
                 'Consider enabling proxyConfiguration in actor input.'
             )
+            type(self).crawl_failed = True
             return
 
         if response.status != 200:
@@ -531,6 +567,7 @@ class MomondoSpider(scrapy.Spider):
                 'Unexpected status %d on poll (page=%d). Skipping page.',
                 response.status, page,
             )
+            type(self).crawl_failed = True
             return
 
         # --- Extract CSRF token from Set-Cookie (once per session) ---
@@ -552,6 +589,26 @@ class MomondoSpider(scrapy.Spider):
         page_size = data.get('pageSize', 50)
         current_page = data.get('pageNumber', page)
 
+        # --- Capture server-issued searchId (on first response for this session) ---
+        server_search_id = data.get('searchId')
+        if server_search_id and search_id is None:
+            logger.info(
+                'Captured server-issued searchId=%r for session (flex_date=%s).',
+                server_search_id, flex_date,
+            )
+            search_id = server_search_id
+        elif server_search_id and search_id is not None and server_search_id != search_id:
+            # Server rotated the searchId — use the new one
+            logger.debug(
+                'searchId rotated: %r -> %r (flex_date=%s)',
+                search_id, server_search_id, flex_date,
+            )
+            search_id = server_search_id
+
+        # --- Track observed filteredCount across sessions ---
+        if filtered_count > self.observed_filtered_count:
+            self.observed_filtered_count = filtered_count
+
         # --- Currency check (best-effort, on first page only) ---
         if page == 1 and results:
             # Inspect the first booking option currency to detect if our cookie
@@ -570,9 +627,34 @@ class MomondoSpider(scrapy.Spider):
 
         logger.info(
             'Poll page %d: %d results returned, filteredCount=%d, '
-            'pageSize=%d, flex_date=%s',
-            current_page, len(results), filtered_count, page_size, flex_date,
+            'pageSize=%d, flex_date=%s, searchId=%r',
+            current_page, len(results), filtered_count, page_size, flex_date, search_id,
         )
+
+        # --- Long-poll retry: page 1 returned 0 results but filteredCount > 0 ---
+        # Server-side search still initialising; re-poll the same page (now with searchId).
+        if page == 1 and not results and filtered_count > 0:
+            if page1_retry_count < _EMPTY_FIRST_PAGE_MAX_RETRIES:
+                logger.info(
+                    'Page 1 empty (filteredCount=%d). Long-poll retry %d/%d '
+                    '(flex_date=%s, searchId=%r).',
+                    filtered_count, page1_retry_count + 1, _EMPTY_FIRST_PAGE_MAX_RETRIES,
+                    flex_date, search_id,
+                )
+                yield self._make_poll_request(
+                    legs=legs,
+                    page=1,
+                    flex_date=flex_date,
+                    search_id=search_id,
+                    page1_retry_count=page1_retry_count + 1,
+                )
+            else:
+                logger.warning(
+                    'Page 1 still empty after %d retries (filteredCount=%d, flex_date=%s). '
+                    'Giving up on this session.',
+                    _EMPTY_FIRST_PAGE_MAX_RETRIES, filtered_count, flex_date,
+                )
+            return
 
         if not results:
             logger.info('No results on page %d (flex_date=%s) — stopping pagination.', page, flex_date)
@@ -608,10 +690,16 @@ class MomondoSpider(scrapy.Spider):
         if results_fetched < filtered_count:
             next_page = current_page + 1
             logger.info(
-                'Paginating: fetched=%d < filtered=%d → requesting page %d (flex_date=%s)',
-                results_fetched, filtered_count, next_page, flex_date,
+                'Paginating: fetched=%d < filtered=%d → requesting page %d '
+                '(flex_date=%s, searchId=%r)',
+                results_fetched, filtered_count, next_page, flex_date, search_id,
             )
-            yield self._make_poll_request(legs=legs, page=next_page, flex_date=flex_date)
+            yield self._make_poll_request(
+                legs=legs,
+                page=next_page,
+                flex_date=flex_date,
+                search_id=search_id,
+            )
 
     def _extract_csrf_from_response(self, response: Response) -> None:
         """No-op: CSRF token is now extracted during bootstrap from page HTML.
@@ -631,13 +719,14 @@ class MomondoSpider(scrapy.Spider):
         legs: list[dict],
         page: int,
         flex_date: str | None,
+        search_id: str | None = None,
     ) -> Generator[Request, None, None]:
         """Handle HTTP 401: attempt one session refresh, then fail permanently."""
         if self._session_refreshed:
             logger.error(
                 'HTTP 401 persists after session refresh. Closing spider as auth_failed.'
             )
-            self.auth_failed = True
+            type(self).auth_failed = True
             raise CloseSpider('auth_failed')
 
         logger.warning(
@@ -647,7 +736,10 @@ class MomondoSpider(scrapy.Spider):
         self.csrf_token = ''  # Force re-extraction during next bootstrap.
 
         # Retry this exact poll request after bootstrap completes.
-        retry_request = self._make_poll_request(legs=legs, page=page, flex_date=flex_date)
+        # Pass search_id through so session state is preserved across the 401 refresh.
+        retry_request = self._make_poll_request(
+            legs=legs, page=page, flex_date=flex_date, search_id=search_id
+        )
         bootstrap_url = self._bootstrap_url()
         yield scrapy.Request(
             url=bootstrap_url,
@@ -687,8 +779,59 @@ class MomondoSpider(scrapy.Spider):
             yield retry_request
 
     def errback_poll(self, failure: Any) -> None:
-        """Handle network-level errors on poll requests."""
-        logger.error('Poll request failed with network error: %s', failure)
+        """Handle network-level errors and HTTP error responses on poll requests.
+
+        Scrapy's HttpErrorMiddleware intercepts non-2xx responses and routes them
+        here as failures rather than to parse_poll. We set crawl_failed so that
+        main.py can report Actor.fail() instead of SUCCEEDED with 0 items.
+        """
+        from scrapy.spidermiddlewares.httperror import HttpError
+        from twisted.web.error import Error as TwistedError
+
+        if failure.check(HttpError):
+            response = failure.value.response
+            status = response.status
+            # 401 has its own session-refresh path; don't mark crawl_failed for it.
+            if status == 401:
+                logger.warning(
+                    'HTTP 401 on poll (errback path) — session refresh not possible from errback. '
+                    'The request will be retried when parse_poll handles it (if HttpErrorMiddleware '
+                    'passes it through). Marking crawl_failed.'
+                )
+                type(self).crawl_failed = True
+            elif 400 <= status < 500:
+                try:
+                    body_preview = response.text[:500]
+                except Exception:
+                    body_preview = '<unreadable>'
+                logger.error(
+                    'HTTP %d on poll request — Momondo rejected the request body. '
+                    'Body preview: %s. Setting crawl_failed=True.',
+                    status, body_preview,
+                )
+                type(self).crawl_failed = True
+            else:
+                logger.error(
+                    'HTTP %d on poll request. Setting crawl_failed=True.', status
+                )
+                type(self).crawl_failed = True
+        else:
+            logger.error('Poll request failed with network error: %s', failure)
+            type(self).crawl_failed = True
+
+    def closed(self, reason: str) -> None:
+        """Spider closed hook: detect silent failure (0 items despite seeing filteredCount > 0)."""
+        if (
+            self.items_yielded == 0
+            and self.observed_filtered_count > 0
+            and not self.auth_failed
+        ):
+            logger.error(
+                'Spider closed with 0 items yielded but observed filteredCount=%d on at least '
+                'one response. Results existed but were not extracted — marking crawl_failed=True.',
+                self.observed_filtered_count,
+            )
+            type(self).crawl_failed = True
 
     # ------------------------------------------------------------------
     # Step 4 — parse_result stub (parser-implementer fills this in)

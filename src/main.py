@@ -216,6 +216,7 @@ async def main() -> None:
 
         # --- Run spider ---
         MomondoSpider.auth_failed = False  # reset before each run
+        MomondoSpider.crawl_failed = False  # reset before each run
         crawler_runner = CrawlerRunner(settings)
         crawl_deferred = crawler_runner.crawl(
             MomondoSpider,
@@ -245,5 +246,20 @@ async def main() -> None:
                 status_message=(
                     'Spider authentication failed. CSRF token or session cookies '
                     'could not be established. Check logs for details.'
+                )
+            )
+            return
+
+        # --- crawl_failed pattern: report non-auth HTTP failures to Apify platform ---
+        # This catches cases where Momondo returned 4xx/5xx on the poll request, or
+        # the spider closed with 0 items despite seeing results in filteredCount.
+        # Without this check, Scrapy exits cleanly (SUCCEEDED with 0 items) and the
+        # failure is invisible on the Apify platform.
+        if MomondoSpider.crawl_failed:
+            await Actor.fail(
+                status_message=(
+                    'Spider crawl failed. The poll request was rejected by Momondo '
+                    '(HTTP 4xx/5xx), or the spider exited with 0 items despite '
+                    'Momondo reporting available results. Check logs for details.'
                 )
             )

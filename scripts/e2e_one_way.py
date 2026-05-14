@@ -19,7 +19,7 @@ ACTOR_ROOT = Path(__file__).parent.parent
 if str(ACTOR_ROOT) not in sys.path:
     sys.path.insert(0, str(ACTOR_ROOT))
 
-from src.spiders.momondo import MomondoSpider, VALID_SEARCH_ID
+from src.spiders.momondo import MomondoSpider
 
 BOOTSTRAP_URL = 'https://www.momondo.com/flight-search/JFK-LHR/2026-08-01/'
 POLL_URL = 'https://www.momondo.com/i/api/search/dynamic/flights/poll'
