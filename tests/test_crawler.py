@@ -17,14 +17,20 @@ The test suite verifies:
   (c) Round-trip poll POST returns 200 with a results key.
   (d) Multi-city legs are built correctly (unit).
   (e) Flexible fan-out generates 2N+1 requests (unit).
+  (f) _build_poll_body page 1 omits searchId; page 2+ includes server-returned searchId.
+  (g) parse_poll captures server-issued searchId and stores it for subsequent requests.
+  (h) crawl_failed is set on HTTP 4xx in errback_poll.
 
 Authentication note (discovered during implementation):
   - The CSRF token is NOT returned in Set-Cookie on the first poll response
     (contrary to earlier research notes).
   - The correct approach: GET the flight-search results page and extract
     window.R9.formToken = '<value>' from the HTML.
-  - 'saECWKdkIP' is the validated constant searchId that works universally
-    across all routes, dates, and session tokens.
+
+searchId note (fix for issue #8):
+  - searchId is server-issued, NOT a client constant.
+  - The first poll omits searchId; server returns a fresh one in the response.
+  - Subsequent polls in the same session include the server-returned searchId.
 """
 
 from __future__ import annotations
@@ -45,7 +51,6 @@ import requests
 
 BOOTSTRAP_URL_TEMPLATE = 'https://www.momondo.com/flight-search/{origin}-{destination}/{date}/'
 POLL_URL = 'https://www.momondo.com/i/api/search/dynamic/flights/poll'
-VALID_SEARCH_ID = 'saECWKdkIP'
 
 HTML_HEADERS = {
     'User-Agent': (
@@ -95,23 +100,30 @@ def bootstrap_session(origin='JFK', destination='LHR', dep_date='2026-09-01') ->
     return session, form_token
 
 
-def make_one_way_body(page: int = 1) -> dict:
+def make_one_way_body(page: int = 1, search_id: str | None = None) -> dict:
+    """Build a one-way poll body.
+
+    Page 1 (search_id=None): omit searchId (server-issued on first response).
+    Page 2+ (search_id='...'): include server-returned searchId.
+    """
+    user_params: dict = {
+        'legs': [
+            {
+                'origin': {'airports': ['JFK'], 'locationType': 'airports'},
+                'destination': {'airports': ['LHR'], 'locationType': 'airports'},
+                'date': '2026-09-01',
+                'flex': 'exact',
+            },
+        ],
+        'passengers': ['ADT'],
+        'passengerDetails': [{'ptc': 'ADT'}],
+        'sortMode': 'bestflight_a',
+    }
+    if search_id is not None:
+        user_params['searchId'] = search_id
     return {
         'filterParams': {},
-        'userSearchParams': {
-            'legs': [
-                {
-                    'origin': {'airports': ['JFK'], 'locationType': 'airports'},
-                    'destination': {'airports': ['LHR'], 'locationType': 'airports'},
-                    'date': '2026-09-01',
-                    'flex': 'exact',
-                },
-            ],
-            'searchId': VALID_SEARCH_ID,
-            'passengers': ['ADT'],
-            'passengerDetails': [{'ptc': 'ADT'}],
-            'sortMode': 'bestflight_a',
-        },
+        'userSearchParams': user_params,
         'searchMetaData': {
             'pageNumber': page,
             'searchTypes': [],
@@ -120,29 +132,36 @@ def make_one_way_body(page: int = 1) -> dict:
     }
 
 
-def make_round_trip_body(page: int = 1) -> dict:
+def make_round_trip_body(page: int = 1, search_id: str | None = None) -> dict:
+    """Build a round-trip poll body.
+
+    Page 1 (search_id=None): omit searchId.
+    Page 2+ (search_id='...'): include server-returned searchId.
+    """
+    user_params: dict = {
+        'legs': [
+            {
+                'origin': {'airports': ['JFK'], 'locationType': 'airports'},
+                'destination': {'airports': ['LHR'], 'locationType': 'airports'},
+                'date': '2026-09-01',
+                'flex': 'exact',
+            },
+            {
+                'origin': {'airports': ['LHR'], 'locationType': 'airports'},
+                'destination': {'airports': ['JFK'], 'locationType': 'airports'},
+                'date': '2026-09-08',
+                'flex': 'exact',
+            },
+        ],
+        'passengers': ['ADT'],
+        'passengerDetails': [{'ptc': 'ADT'}],
+        'sortMode': 'bestflight_a',
+    }
+    if search_id is not None:
+        user_params['searchId'] = search_id
     return {
         'filterParams': {},
-        'userSearchParams': {
-            'legs': [
-                {
-                    'origin': {'airports': ['JFK'], 'locationType': 'airports'},
-                    'destination': {'airports': ['LHR'], 'locationType': 'airports'},
-                    'date': '2026-09-01',
-                    'flex': 'exact',
-                },
-                {
-                    'origin': {'airports': ['LHR'], 'locationType': 'airports'},
-                    'destination': {'airports': ['JFK'], 'locationType': 'airports'},
-                    'date': '2026-09-08',
-                    'flex': 'exact',
-                },
-            ],
-            'searchId': VALID_SEARCH_ID,
-            'passengers': ['ADT'],
-            'passengerDetails': [{'ptc': 'ADT'}],
-            'sortMode': 'bestflight_a',
-        },
+        'userSearchParams': user_params,
         'searchMetaData': {
             'pageNumber': page,
             'searchTypes': [],
@@ -166,17 +185,19 @@ def test_bootstrap_get():
 
 @pytest.mark.live
 def test_one_way_poll():
-    """(b) One-way poll POST returns HTTP 200 with a non-empty "results" key."""
+    """(b) One-way poll POST (page 1, no searchId) returns HTTP 200 with a results key
+    and a server-issued searchId in the response."""
     session, form_token = bootstrap_session()
 
     poll_headers = dict(POLL_HEADERS_BASE)
     poll_headers['x-csrf'] = form_token
     poll_headers['Referer'] = BOOTSTRAP_URL_TEMPLATE.format(origin='JFK', destination='LHR', date='2026-09-01')
 
+    # Page 1: no searchId in body (server issues one in the response)
     resp = session.post(
         POLL_URL,
         headers=poll_headers,
-        data=json.dumps(make_one_way_body()),
+        data=json.dumps(make_one_way_body(page=1, search_id=None)),
         timeout=30,
     )
     assert resp.status_code == 200, (
@@ -186,9 +207,13 @@ def test_one_way_poll():
     data = resp.json()
     assert 'results' in data, f'"results" key missing from poll response. Keys: {list(data.keys())}'
 
+    # Server must return a searchId in the response
+    server_search_id = data.get('searchId')
+    assert server_search_id, f'Server did not return a searchId in first poll response. Keys: {list(data.keys())}'
+    print(f'\n[PASS] One-way poll -> {resp.status_code}, server searchId={server_search_id!r}')
+
     results = data['results']
-    print(f'\n[PASS] One-way poll -> {resp.status_code}, {len(results)} results returned')
-    print(f'       filteredCount={data.get("filteredCount")}, pageSize={data.get("pageSize")}')
+    print(f'       {len(results)} results returned, filteredCount={data.get("filteredCount")}, pageSize={data.get("pageSize")}')
 
     # Verify pagination keys are present
     assert 'filteredCount' in data
@@ -198,17 +223,18 @@ def test_one_way_poll():
 
 @pytest.mark.live
 def test_round_trip_poll():
-    """(c) Round-trip poll POST returns HTTP 200 with a "results" key."""
+    """(c) Round-trip poll POST (page 1, no searchId) returns HTTP 200 with a "results" key."""
     session, form_token = bootstrap_session()
 
     poll_headers = dict(POLL_HEADERS_BASE)
     poll_headers['x-csrf'] = form_token
     poll_headers['Referer'] = BOOTSTRAP_URL_TEMPLATE.format(origin='JFK', destination='LHR', date='2026-09-01')
 
+    # Page 1: no searchId
     resp = session.post(
         POLL_URL,
         headers=poll_headers,
-        data=json.dumps(make_round_trip_body()),
+        data=json.dumps(make_round_trip_body(page=1, search_id=None)),
         timeout=30,
     )
     assert resp.status_code == 200, (
@@ -217,10 +243,13 @@ def test_round_trip_poll():
 
     data = resp.json()
     assert 'results' in data, f'"results" key missing. Keys: {list(data.keys())}'
+    server_search_id = data.get('searchId')
+    assert server_search_id, 'Server did not return searchId in round-trip first poll'
 
     results = data['results']
     print(f'\n[PASS] Round-trip poll -> {resp.status_code}, {len(results)} results returned')
     print(f'       filteredCount={data.get("filteredCount")}, pageSize={data.get("pageSize")}')
+    print(f'       server searchId={server_search_id!r}')
 
 
 # ---------------------------------------------------------------------------
@@ -484,13 +513,146 @@ def test_csrf_extracted_from_bootstrap_html():
     print('[PASS] formToken regex: no false positive on missing token')
 
 
-def test_valid_search_id_constant():
-    """VALID_SEARCH_ID constant is the confirmed working searchId."""
+# ---------------------------------------------------------------------------
+# New unit tests for dynamic searchId fix (issue #8)
+# ---------------------------------------------------------------------------
+
+def test_build_poll_body_page1_omits_searchid():
+    """BLOCKER fix #8: page 1 poll body must NOT contain searchId in userSearchParams."""
     try:
-        from src.spiders.momondo import VALID_SEARCH_ID
+        from src.spiders.momondo import MomondoSpider
     except ImportError:
         pytest.skip('Scrapy not installed — skipping unit import test')
 
-    assert VALID_SEARCH_ID == 'saECWKdkIP', f'Unexpected VALID_SEARCH_ID: {VALID_SEARCH_ID!r}'
-    assert len(VALID_SEARCH_ID) == 10, f'Expected 10 chars, got {len(VALID_SEARCH_ID)}'
-    print(f'\n[PASS] VALID_SEARCH_ID = {VALID_SEARCH_ID!r} (confirmed working constant)')
+    spider = MomondoSpider(trip_type='one-way', origin='JFK', destination='LHR', departure_date='2026-09-01')
+    legs = spider._build_legs()
+
+    # Page 1 with no search_id (first poll, server not yet queried)
+    body = spider._build_poll_body(legs=legs, page=1, search_id=None)
+
+    user_params = body.get('userSearchParams', {})
+    assert 'searchId' not in user_params, (
+        f'Page 1 must NOT include searchId in userSearchParams. '
+        f'Got keys: {list(user_params.keys())}'
+    )
+    print('\n[PASS] Page 1 poll body correctly omits searchId (BLOCKER fix #8)')
+
+
+def test_build_poll_body_pageN_includes_searchid():
+    """BLOCKER fix #8: page 2+ poll body MUST include the server-returned searchId."""
+    try:
+        from src.spiders.momondo import MomondoSpider
+    except ImportError:
+        pytest.skip('Scrapy not installed — skipping unit import test')
+
+    spider = MomondoSpider(trip_type='one-way', origin='JFK', destination='LHR', departure_date='2026-09-01')
+    legs = spider._build_legs()
+    server_search_id = 'sgFCJ_ktTO'  # example server-issued value
+
+    body = spider._build_poll_body(legs=legs, page=2, search_id=server_search_id)
+
+    user_params = body.get('userSearchParams', {})
+    assert 'searchId' in user_params, (
+        f'Page 2 must include searchId in userSearchParams. '
+        f'Got keys: {list(user_params.keys())}'
+    )
+    assert user_params['searchId'] == server_search_id, (
+        f'Expected searchId={server_search_id!r}, got {user_params["searchId"]!r}'
+    )
+    print(f'\n[PASS] Page 2 poll body includes searchId={server_search_id!r} (BLOCKER fix #8)')
+
+
+def test_parse_poll_captures_searchid():
+    """BLOCKER fix #8: parse_poll must capture searchId from first response and thread it forward."""
+    try:
+        from scrapy.http import TextResponse, Request
+        from src.spiders.momondo import MomondoSpider
+    except ImportError:
+        pytest.skip('Scrapy not installed — skipping unit import test')
+
+    spider = MomondoSpider(trip_type='one-way', origin='JFK', destination='LHR', departure_date='2026-09-01')
+    spider.csrf_token = 'test-token'
+
+    # Build a minimal mock response body that simulates a first poll response
+    # with a server-issued searchId and empty results (search still initialising)
+    mock_body = json.dumps({
+        'searchId': 'sgFiCFS7bb',
+        'results': [],
+        'filteredCount': 10,
+        'pageSize': 50,
+        'pageNumber': 1,
+    })
+
+    legs = spider._build_legs()
+    mock_url = 'https://www.momondo.com/i/api/search/dynamic/flights/poll'
+    response = TextResponse(
+        url=mock_url,
+        body=mock_body.encode('utf-8'),
+        encoding='utf-8',
+        status=200,
+        request=Request(url=mock_url),
+    )
+
+    # Run parse_poll (page 1, no prior searchId) — should trigger long-poll retry
+    requests_fired = list(spider.parse_poll(
+        response=response,
+        legs=legs,
+        page=1,
+        flex_date=None,
+        search_id=None,
+        page1_retry_count=0,
+    ))
+
+    # Should have fired exactly one retry request (empty first page, filteredCount > 0)
+    assert len(requests_fired) == 1, (
+        f'Expected 1 retry request for empty page 1 with filteredCount=10, '
+        f'got {len(requests_fired)}'
+    )
+
+    # The retry request body must include the captured searchId
+    retry_body = json.loads(requests_fired[0].body)
+    user_params = retry_body.get('userSearchParams', {})
+    assert 'searchId' in user_params, (
+        f'Retry request must include the captured searchId. '
+        f'userSearchParams keys: {list(user_params.keys())}'
+    )
+    assert user_params['searchId'] == 'sgFiCFS7bb', (
+        f'Expected searchId="sgFiCFS7bb", got {user_params.get("searchId")!r}'
+    )
+    print('\n[PASS] parse_poll captures searchId from first response and threads it to retry request')
+
+
+def test_crawl_failed_set_on_4xx():
+    """BLOCKER fix #8 / issue #6: crawl_failed must be set to True when poll returns 4xx."""
+    try:
+        from scrapy.http import TextResponse, Request, Response
+        from twisted.python.failure import Failure
+        from scrapy.spidermiddlewares.httperror import HttpError
+        from src.spiders.momondo import MomondoSpider
+    except ImportError:
+        pytest.skip('Scrapy not installed — skipping unit import test')
+
+    spider = MomondoSpider(trip_type='one-way', origin='JFK', destination='LHR', departure_date='2026-09-01')
+    assert not spider.crawl_failed, 'crawl_failed should start False'
+
+    # Build a mock 400 response and a Failure wrapping an HttpError
+    mock_url = 'https://www.momondo.com/i/api/search/dynamic/flights/poll'
+    bad_response = TextResponse(
+        url=mock_url,
+        body=b'{"code": "INVALID_SEARCH_ID", "description": "Could not find search"}',
+        encoding='utf-8',
+        status=400,
+        request=Request(url=mock_url),
+    )
+
+    try:
+        raise HttpError(bad_response, 'HTTP 400')
+    except HttpError as e:
+        failure = Failure(e)
+
+    spider.errback_poll(failure)
+
+    assert spider.crawl_failed, (
+        'crawl_failed should be True after errback_poll with HTTP 400'
+    )
+    print('\n[PASS] crawl_failed=True after errback_poll with HTTP 400 (BLOCKER fix #8 / issue #6)')
