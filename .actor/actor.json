@@ -3,7 +3,7 @@
 	"name": "momondo-flights",
 	"title": "Momondo Flight Scraper",
 	"description": "Extract flight search results from Momondo.com. Supports one-way, round-trip, multi-city, and flexible date searches. Returns detailed flight info including per-leg segments, booking options, and pricing.",
-	"version": "1.0.0",
+	"version": "1.0",
 	"buildTag": "latest",
 	"meta": {
 		"templateId": "python-scrapy",
