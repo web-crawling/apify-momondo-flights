@@ -1,0 +1,218 @@
+{
+	"actorSpecification": 1,
+	"fields": {
+		"type": "object",
+		"properties": {
+			"result_id": {
+				"type": "string",
+				"description": "Momondo-assigned unique identifier for this flight result; use for deduplication."
+			},
+			"trip_id": {
+				"type": "string",
+				"description": "Momondo trip grouping identifier."
+			},
+			"origin": {
+				"type": "object",
+				"description": "Departure airport object with code and name.",
+				"properties": {
+					"code": {
+						"type": "string",
+						"description": "3-letter IATA airport code."
+					},
+					"name": {
+						"type": "string",
+						"description": "Full airport name."
+					}
+				}
+			},
+			"destination": {
+				"type": "object",
+				"description": "Arrival airport object with code and name.",
+				"properties": {
+					"code": {
+						"type": "string",
+						"description": "3-letter IATA airport code."
+					},
+					"name": {
+						"type": "string",
+						"description": "Full airport name."
+					}
+				}
+			},
+			"departure_time": {
+				"type": "string",
+				"format": "date-time",
+				"description": "Local departure time at origin airport (ISO 8601 format)."
+			},
+			"arrival_time": {
+				"type": "string",
+				"format": "date-time",
+				"description": "Local arrival time at destination airport (ISO 8601 format)."
+			},
+			"duration_minutes": {
+				"type": "integer",
+				"description": "Total trip duration in minutes (all legs combined)."
+			},
+			"stops": {
+				"type": "integer",
+				"description": "Number of stops (0 = nonstop). Derived from segment count minus 1 per leg."
+			},
+			"legs": {
+				"type": "array",
+				"description": "Per-leg details for the flight itinerary. One-way = 1 leg; round-trip = 2 legs; multi-city = N legs.",
+				"items": {
+					"type": "object",
+					"description": "A single leg object containing origin, destination, times, duration, stops, and segments.",
+					"properties": {
+						"origin": {
+							"type": "object",
+							"description": "Leg-level departure airport with code and name.",
+							"properties": {
+								"code": {
+									"type": "string"
+								},
+								"name": {
+									"type": "string"
+								}
+							}
+						},
+						"destination": {
+							"type": "object",
+							"description": "Leg-level arrival airport with code and name.",
+							"properties": {
+								"code": {
+									"type": "string"
+								},
+								"name": {
+									"type": "string"
+								}
+							}
+						},
+						"departure_time": {
+							"type": "string",
+							"format": "date-time",
+							"description": "Local departure time for this leg (ISO 8601)."
+						},
+						"arrival_time": {
+							"type": "string",
+							"format": "date-time",
+							"description": "Local arrival time for this leg (ISO 8601)."
+						},
+						"duration_minutes": {
+							"type": "integer",
+							"description": "Leg duration in minutes."
+						},
+						"stops": {
+							"type": "integer",
+							"description": "Number of stops within this leg."
+						},
+						"segments": {
+							"type": "array",
+							"description": "Individual flight segments within the leg.",
+							"items": {
+								"type": "object",
+								"description": "A single flight segment with airline, flight number, aircraft, and times.",
+								"properties": {
+									"airline_code": {
+										"type": "string",
+										"description": "2-letter IATA carrier code (e.g., BA, AA, LH)."
+									},
+									"airline_name": {
+										"type": "string",
+										"description": "Full airline display name (e.g., British Airways)."
+									},
+									"flight_number": {
+										"type": "string",
+										"description": "Full flight number including carrier code (e.g., BA177)."
+									},
+									"aircraft_type": {
+										"type": "string",
+										"description": "Aircraft type string (e.g., Boeing 777-200)."
+									},
+									"origin": {
+										"type": "object",
+										"description": "Segment departure airport.",
+										"properties": {
+											"code": {
+												"type": "string"
+											},
+											"name": {
+												"type": "string"
+											}
+										}
+									},
+									"destination": {
+										"type": "object",
+										"description": "Segment arrival airport.",
+										"properties": {
+											"code": {
+												"type": "string"
+											},
+											"name": {
+												"type": "string"
+											}
+										}
+									},
+									"departure_time": {
+										"type": "string",
+										"format": "date-time",
+										"description": "Local departure time for this segment (ISO 8601)."
+									},
+									"arrival_time": {
+										"type": "string",
+										"format": "date-time",
+										"description": "Local arrival time for this segment (ISO 8601)."
+									},
+									"duration_minutes": {
+										"type": "integer",
+										"description": "Segment duration in minutes."
+									}
+								}
+							}
+						}
+					}
+				}
+			},
+			"booking_options": {
+				"type": "array",
+				"description": "Available booking partners with prices and URLs.",
+				"items": {
+					"type": "object",
+					"description": "A single booking option with provider, price, and booking URL.",
+					"properties": {
+						"provider_code": {
+							"type": "string",
+							"description": "Internal provider code."
+						},
+						"provider_name": {
+							"type": "string",
+							"description": "Display name of the booking partner."
+						},
+						"price": {
+							"type": "number",
+							"description": "Price in the requested currency."
+						},
+						"currency": {
+							"type": "string",
+							"description": "ISO 4217 currency code (e.g., USD, EUR, GBP)."
+						},
+						"booking_url": {
+							"type": "string",
+							"format": "uri",
+							"description": "Direct deep link to the booking partner page."
+						},
+						"cabin_class": {
+							"type": "string",
+							"description": "Cabin class for this booking option (e.g., Economy, Business)."
+						}
+					}
+				}
+			},
+			"scraped_at": {
+				"type": "string",
+				"format": "date-time",
+				"description": "UTC timestamp when this result was collected (ISO 8601 format)."
+			}
+		}
+	}
+}
