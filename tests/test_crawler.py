@@ -705,3 +705,59 @@ def test_crawl_failed_set_on_4xx():
         'crawl_failed should be True after errback_poll with HTTP 400'
     )
     print('\n[PASS] crawl_failed=True after errback_poll with HTTP 400 (BLOCKER fix #8 / issue #6)')
+
+
+def test_long_poll_retries_when_first_poll_returns_zero_results_and_zero_filtered_count():
+    """Follow-up fix for issue #8: on Apify datacenter IPs, the first poll may return
+    0 results AND filteredCount=0 even when results would materialise on retry. The
+    retry condition must NOT require filteredCount > 0 — it should retry whenever
+    page 1 returns 0 results.
+    """
+    try:
+        from scrapy.http import TextResponse, Request
+        from src.spiders.momondo import MomondoSpider
+    except ImportError:
+        pytest.skip('Scrapy not installed — skipping unit import test')
+
+    spider = MomondoSpider(trip_type='one-way', origin='JFK', destination='LHR',
+                           departure_date='2026-09-01')
+    spider.csrf_token = 'test-token'
+
+    # First poll response — server-issued searchId but EMPTY filteredCount (the
+    # case that was previously not retried)
+    mock_body = json.dumps({
+        'searchId': 'sgFiCFS7bb',
+        'results': [],
+        'filteredCount': 0,
+        'pageSize': 50,
+        'pageNumber': 1,
+    })
+
+    mock_url = 'https://www.momondo.com/i/api/search/dynamic/flights/poll'
+    response = TextResponse(
+        url=mock_url,
+        body=mock_body.encode('utf-8'),
+        encoding='utf-8',
+        status=200,
+        request=Request(url=mock_url),
+    )
+
+    legs = spider._build_legs()
+    requests_fired = list(spider.parse_poll(
+        response=response,
+        legs=legs,
+        page=1,
+        flex_date=None,
+        search_id=None,
+        page1_retry_count=0,
+    ))
+
+    assert len(requests_fired) == 1, (
+        f'Expected 1 retry request when page 1 returns 0 results AND filteredCount=0; '
+        f'got {len(requests_fired)}'
+    )
+    retry_body = json.loads(requests_fired[0].body)
+    assert retry_body['userSearchParams']['searchId'] == 'sgFiCFS7bb', (
+        'Retry must reuse the server-issued searchId from the first response'
+    )
+    print('\n[PASS] long-poll retry fires even when filteredCount=0 (issue #8 follow-up fix)')

@@ -82,9 +82,16 @@ PTC_ADULT = 'ADT'
 PTC_CHILD = 'CNN'
 PTC_INFANT = 'INF'
 
-# Maximum retries when first poll returns filteredCount > 0 but 0 results
-# (server-side search still initialising; long-polling style).
-_EMPTY_FIRST_PAGE_MAX_RETRIES = 3
+# Maximum retries when first poll returns 0 results (regardless of filteredCount).
+# On Apify datacenter IPs, Momondo may return 0 results AND filteredCount=0 on the
+# first poll even when results will materialise on subsequent polls with the searchId.
+# Bumped from 3 to 5 to give more time for Momondo's server-side search initialisation.
+_EMPTY_FIRST_PAGE_MAX_RETRIES = 5
+
+# Exponential backoff delays (seconds) between page-1 retries.
+# Index = retry attempt number (0-based); capped at last value if retries exceed list length.
+# Pattern: 1s, 2s, 3s, 5s, 8s (Fibonacci-like growth).
+_RETRY_BACKOFF_SECONDS = [1, 2, 3, 5, 8]
 
 # Cabin class client-side filter (QA-confirmed 2026-05-14):
 # cabinClass is NOT accepted in the Momondo poll body (HTTP 400 VALIDATION_ERROR).
@@ -536,7 +543,9 @@ class MomondoSpider(scrapy.Spider):
 
         1. Handle non-200 status codes.
         2. Capture server-issued searchId from first response.
-        3. Long-poll retry if first page returns 0 results but filteredCount > 0.
+        3. Long-poll retry if first page returns 0 results (regardless of filteredCount).
+           On Apify datacenter IPs, filteredCount may also be 0 on the first poll even
+           when results will materialise on subsequent polls with the captured searchId.
         4. Yield each result to parse_result().
         5. Fire next-page request if pagination continues.
         """
@@ -631,16 +640,28 @@ class MomondoSpider(scrapy.Spider):
             current_page, len(results), filtered_count, page_size, flex_date, search_id,
         )
 
-        # --- Long-poll retry: page 1 returned 0 results but filteredCount > 0 ---
-        # Server-side search still initialising; re-poll the same page (now with searchId).
-        if page == 1 and not results and filtered_count > 0:
+        # --- Long-poll retry: page 1 returned 0 results ---
+        # Retry regardless of filteredCount value.
+        #
+        # BLOCKER FIX (issue #8 follow-up): On Apify datacenter IPs, Momondo returns
+        # 0 results AND filteredCount=0 on the first poll even though the search is
+        # active (the server issues a searchId, proving the request was accepted).
+        # The old condition "filtered_count > 0" caused the spider to give up immediately.
+        # The fix: retry unconditionally when page 1 is empty, for up to
+        # _EMPTY_FIRST_PAGE_MAX_RETRIES attempts with exponential backoff.
+        if page == 1 and not results:
             if page1_retry_count < _EMPTY_FIRST_PAGE_MAX_RETRIES:
+                # Exponential backoff: index into _RETRY_BACKOFF_SECONDS; cap at last value.
+                backoff_idx = min(page1_retry_count, len(_RETRY_BACKOFF_SECONDS) - 1)
+                delay = _RETRY_BACKOFF_SECONDS[backoff_idx]
                 logger.info(
-                    'Page 1 empty (filteredCount=%d). Long-poll retry %d/%d '
+                    'Page 1 empty (filteredCount=%d). Long-poll retry %d/%d after %ds '
                     '(flex_date=%s, searchId=%r).',
                     filtered_count, page1_retry_count + 1, _EMPTY_FIRST_PAGE_MAX_RETRIES,
-                    flex_date, search_id,
+                    delay, flex_date, search_id,
                 )
+                import time as _time
+                _time.sleep(delay)
                 yield self._make_poll_request(
                     legs=legs,
                     page=1,
@@ -649,11 +670,12 @@ class MomondoSpider(scrapy.Spider):
                     page1_retry_count=page1_retry_count + 1,
                 )
             else:
-                logger.warning(
+                logger.error(
                     'Page 1 still empty after %d retries (filteredCount=%d, flex_date=%s). '
-                    'Giving up on this session.',
+                    'Giving up on this session — marking crawl_failed.',
                     _EMPTY_FIRST_PAGE_MAX_RETRIES, filtered_count, flex_date,
                 )
+                type(self).crawl_failed = True
             return
 
         if not results:
