@@ -17,8 +17,8 @@ TELNETCONSOLE_ENABLED = False
 # Do not change the Twisted reactor unless you really know what you are doing.
 TWISTED_REACTOR = 'twisted.internet.asyncioreactor.AsyncioSelectorReactor'
 
-# Session cookies are the primary auth mechanism — must be enabled.
-COOKIES_ENABLED = True
+# Session cookies live in the browser (src/browser.py), not in Scrapy.
+COOKIES_ENABLED = False
 
 # Brotli decompression: requires the `brotli` package (in requirements.txt).
 # Scrapy auto-detects and uses it via Accept-Encoding header.
@@ -41,4 +41,11 @@ ITEM_PIPELINES = {
 }
 
 SPIDER_MIDDLEWARES = {}
-DOWNLOADER_MIDDLEWARES = {}
+# Every request is carried by the headful browser session (src/middlewares.py):
+# Momondo walls plain HTTP clients and headless browsers.
+DOWNLOADER_MIDDLEWARES = {
+    'src.middlewares.BrowserTransportMiddleware': 950,
+}
+
+# One browser page carries the whole run; keep requests sequential.
+CONCURRENT_REQUESTS = 1

@@ -1,6 +1,7 @@
-# Feel free to add your Python dependencies below. For formatting guidelines, see:
-# https://pip.pypa.io/en/latest/reference/requirements-file-format/
-
-apify[scrapy] < 4.0.0
-scrapy < 3.0.0
+# Pinned: an unpinned rebuild (2026-10) pulled Scrapy 2.19, which silently skipped the
+# old start_requests() entry point and ran 0 requests. Bump deliberately, with tests.
+apify[scrapy]==3.4.1
+scrapy==2.19.0
+# Must match the browser bundled in the apify/actor-python-playwright:3.13 base image.
+playwright==1.64.0
 brotli

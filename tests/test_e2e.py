@@ -352,7 +352,9 @@ def test_input_schema_prefill_has_no_invalid_fields():
     assert props['tripType']['default'] == 'one-way'
     assert props['origin']['default'] == 'JFK'
     assert props['destination']['default'] == 'LHR'
-    assert props['departureDate']['default'] == '2026-08-01'
+    # No fixed default date: a hard-coded date goes stale and breaks the daily Store test.
+    # main.py searches DEFAULT_DAYS_AHEAD days from today when departureDate is empty.
+    assert 'default' not in props['departureDate']
 
     # Verify legs array has no minItems (per CLAUDE.md: only add minItems when it's the sole input)
     legs_prop = props.get('legs', {})
@@ -360,10 +362,8 @@ def test_input_schema_prefill_has_no_invalid_fields():
         'legs should NOT have minItems — Apify QA submits empty arrays as validity check'
     )
 
-    # Verify proxyConfiguration is optional (no required constraint)
-    # proxyConfiguration default is null — must not be in required array
-    required_fields = schema.get('required', [])
-    assert 'proxyConfiguration' not in required_fields
+    # No proxy input: proxy traffic on users' runs would be billed to us under pay-per-event.
+    assert 'proxyConfiguration' not in props
 
 
 # ---------------------------------------------------------------------------

@@ -182,7 +182,7 @@
 					"properties": {
 						"provider_code": {
 							"type": "string",
-							"description": "Internal provider code."
+							"description": "Momondo's code for the booking provider."
 						},
 						"provider_name": {
 							"type": "string",
@@ -190,7 +190,7 @@
 						},
 						"price": {
 							"type": "number",
-							"description": "Price in the requested currency."
+							"description": "Price per passenger in the given currency. Includes the bag fees for the bags requested in checkedBags / carryOnBag (see bags_requested)."
 						},
 						"currency": {
 							"type": "string",
@@ -204,6 +204,86 @@
 						"cabin_class": {
 							"type": "string",
 							"description": "Cabin class for this booking option (e.g., Economy, Business)."
+						},
+						"base_price": {
+							"type": "number",
+							"description": "Fare per passenger before any bag fees."
+						},
+						"total_price_all_passengers": {
+							"type": "number",
+							"description": "Price for all passengers together, including the requested bags."
+						},
+						"carry_on_bag": {
+							"type": "object",
+							"description": "Carry-on bag allowance and fee for this booking option.",
+							"properties": {
+								"status": {
+									"type": "string",
+									"description": "included = no extra cost in this price (free allowance, or its fee was already added because you requested the bag); fee = costs extra, see fee; unknown = the provider publishes no price for it."
+								},
+								"fee": {
+									"type": "number",
+									"description": "Bag fee per passenger, in the booking option's currency."
+								},
+								"bags_in_price": {
+									"type": "integer",
+									"description": "How many of these bags per passenger the price covers."
+								}
+							}
+						},
+						"checked_bag": {
+							"type": "object",
+							"description": "Checked bag allowance and fee for this booking option.",
+							"properties": {
+								"status": {
+									"type": "string",
+									"description": "included = no extra cost in this price (free allowance, or its fee was already added because you requested the bag); fee = costs extra, see fee; unknown = the provider publishes no price for it."
+								},
+								"fee": {
+									"type": "number",
+									"description": "Bag fee per passenger, in the booking option's currency."
+								},
+								"bags_in_price": {
+									"type": "integer",
+									"description": "How many of these bags per passenger the price covers."
+								}
+							}
+						}
+					}
+				}
+			},
+			"bags_requested": {
+				"type": "object",
+				"description": "The bag selection priced into each booking option's price.",
+				"properties": {
+					"checked_bags": {
+						"type": "integer",
+						"description": "Checked bags per passenger (0-2)."
+					},
+					"carry_on_bag": {
+						"type": "boolean",
+						"description": "Whether one carry-on bag per passenger is included."
+					}
+				}
+			},
+			"baggage_policy_links": {
+				"type": "array",
+				"description": "Baggage and fee policy page of each airline on this itinerary, for special items such as sports equipment.",
+				"items": {
+					"type": "object",
+					"properties": {
+						"airline_code": {
+							"type": "string",
+							"description": "2-letter IATA carrier code."
+						},
+						"airline_name": {
+							"type": "string",
+							"description": "Airline name."
+						},
+						"url": {
+							"type": "string",
+							"format": "uri",
+							"description": "Airline baggage policy page."
 						}
 					}
 				}

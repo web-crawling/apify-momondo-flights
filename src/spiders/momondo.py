@@ -28,8 +28,8 @@ Authentication (CSRF):
   - Bootstrap: GET /flight-search/{origin}-{destination}/{date}/ to obtain
     session cookies AND extract formToken from the HTML.
   - formToken is sent as the x-csrf header on all poll POST requests.
-  - On HTTP 401: bootstrap is re-run once (_session_refreshed flag prevents an
-    infinite refresh loop). If 401 persists after refresh, set auth_failed=True
+  - On HTTP 401, or a 403 bot captcha on a poll: the search page is re-opened in a
+    fresh browser context, at most _MAX_SESSION_REFRESHES times per run. If 401 persists after refresh, set auth_failed=True
     and raise CloseSpider('auth_failed').
 
 searchId:
@@ -41,16 +41,15 @@ searchId:
     The searchId is threaded per-session through cb_kwargs.
 
 Poll API field restrictions (QA confirmed 2026-05-14):
-  - cabinClass, currency, and stops/maxStops are NOT accepted in the poll body.
+  - userSearchParams.cabinClass/currency and filterParams.stops are NOT accepted.
   - Sending them causes HTTP 400 VALIDATION_ERROR: Unrecognized field.
-  - cabinClass filtering is applied client-side in parse_result().
+  - The cabin IS accepted per leg (legs[].cabinClass, verified 2026-10-15) and is
+    sent there; parse_result() still keeps only results with a matching cabin.
   - maxStops filtering is applied client-side in parse_result().
-  - currency: Momondo sets pricing currency via a session cookie on the bootstrap
-    GET. The spider sets currency=<code> and kyk_curr=<code> cookies on the
-    bootstrap request; if Momondo respects them the prices come back in the
-    requested currency, otherwise prices remain in USD (the default). The currency
-    parameter is kept in the input schema for forward compatibility and documented
-    as best-effort.
+  - currency: selected per browser session through the site's currency picker
+    endpoint (src/browser.py); the price currency is displayPrice.currency.
+  - Bags: the site's own filter string filterParams.fs ("cfc=1;bfc=N") IS accepted
+    (verified 2026-10-15) and prices fares with the requested bags.
 """
 
 from __future__ import annotations
@@ -79,8 +78,8 @@ BOOTSTRAP_URL_TEMPLATE = 'https://www.momondo.com/flight-search/{origin}-{destin
 
 # Passenger type codes
 PTC_ADULT = 'ADT'
-PTC_CHILD = 'CNN'
-PTC_INFANT = 'INF'
+PTC_CHILD = 'CHD'  # CNN is rejected with HTTP 400 (seen 2026-10-15); the site sends CHD
+PTC_INFANT = 'INL'  # infant on lap, as the site sends it
 
 # Maximum retries when first poll returns 0 results (regardless of filteredCount).
 # On Apify datacenter IPs, Momondo may return 0 results AND filteredCount=0 on the
@@ -92,6 +91,17 @@ _EMPTY_FIRST_PAGE_MAX_RETRIES = 5
 # Index = retry attempt number (0-based); capped at last value if retries exceed list length.
 # Pattern: 1s, 2s, 3s, 5s, 8s (Fibonacci-like growth).
 _RETRY_BACKOFF_SECONDS = [1, 2, 3, 5, 8]
+
+# Re-polls of page 1 while Momondo is still collecting fares (status != "complete").
+# 15 x 2 s covers the ~10-25 s a search usually takes.
+_MAX_PHASE_POLLS = 15
+_PHASE_POLL_DELAY_SECONDS = 2
+
+# Fresh browser sessions a run may open after a 401 / bot captcha on a poll.
+_MAX_SESSION_REFRESHES = 2
+
+# Poll statuses parse_poll handles itself instead of Scrapy's HttpError errback.
+_POLL_HANDLED_STATUSES = [401, 403, 429]
 
 # Cabin class client-side filter (QA-confirmed 2026-05-14):
 # cabinClass is NOT accepted in the Momondo poll body (HTTP 400 VALIDATION_ERROR).
@@ -113,6 +123,15 @@ _RETRY_BACKOFF_SECONDS = [1, 2, 3, 5, 8]
 _FORM_TOKEN_RE = re.compile(r"window\.R9\.formToken\s*=\s*'([^']+)'")
 
 
+# Per-leg cabin values the site sends (verified 2026-10-15).
+_CABIN_PARAM = {
+    'ECONOMY': 'economy',
+    'PREMIUM_ECONOMY': 'premium-economy',
+    'BUSINESS': 'business',
+    'FIRST': 'first',
+}
+
+
 def _cabin_matches(cabin_display: str, requested_class: str) -> bool:
     """Return True if the booking option's cabin display value matches the requested class.
 
@@ -123,24 +142,83 @@ def _cabin_matches(cabin_display: str, requested_class: str) -> bool:
 
     Matching rules (case-insensitive):
       ECONOMY        → True if cabin contains "economy" (e.g. "Economy", "Economy Light", "Basic", "Blue Basic")
-                       Note: "Premium Economy" contains "economy" but NOT for ECONOMY filter —
-                       we exclude it by checking "premium" is absent.
-      PREMIUM_ECONOMY → True if cabin contains "premium" (case-insensitive)
+                       Note: "Premium Economy" / "Prem Economy" contain "economy" but NOT for
+                       the ECONOMY filter — we exclude them by checking "prem" is absent.
+      PREMIUM_ECONOMY → True if cabin contains "prem" (case-insensitive)
       BUSINESS        → True if cabin contains "business" (case-insensitive)
       FIRST           → True if cabin contains "first" (case-insensitive)
     """
     c = cabin_display.lower()
     if requested_class == 'ECONOMY':
         # "Economy" but NOT "Premium Economy"
-        return 'economy' in c and 'premium' not in c
+        return 'economy' in c and 'prem' not in c
     if requested_class == 'PREMIUM_ECONOMY':
-        return 'premium' in c
+        return 'prem' in c  # Momondo displays "Prem Economy" as well as "Premium Economy"
     if requested_class == 'BUSINESS':
         return 'business' in c
     if requested_class == 'FIRST':
         return 'first' in c
     # Unknown class — do not filter
     return True
+
+
+def _amount(price_obj: dict | None) -> float | None:
+    """Numeric amount of a Momondo {"price": ..., "currency": ...} object."""
+    if isinstance(price_obj, dict) and isinstance(price_obj.get('price'), (int, float)):
+        return price_obj['price']
+    return None
+
+
+def _bag(bag_data: dict | None) -> dict:
+    """Normalise a fees.carryOnBagData / fees.checkedBagData block.
+
+    status: "included" — the bag is in `price` (free allowance, or its fee was added
+            because the bag was requested), "fee" — costs extra (fee known, not in
+            `price`), "unknown" — the provider publishes no bag price.
+    fee: per-passenger bag fee; bags_in_price: how many of these bags `price` covers.
+    """
+    if not isinstance(bag_data, dict):
+        return {'status': 'unknown'}
+    bag = {'status': str(bag_data.get('status') or 'UNKNOWN').lower()}
+    fee = _amount(bag_data.get('displayPrice'))
+    if fee is not None:
+        bag['fee'] = fee
+    if isinstance(bag_data.get('numSelected'), int):
+        bag['bags_in_price'] = bag_data['numSelected']
+    return bag
+
+
+def _fee_fields(fees: dict | None) -> dict:
+    """Bag and price-breakdown fields for one booking option (absent keys = not published)."""
+    if not isinstance(fees, dict):
+        return {}
+    fields: dict = {
+        'carry_on_bag': _bag(fees.get('carryOnBagData')),
+        'checked_bag': _bag(fees.get('checkedBagData')),
+    }
+    base = _amount(fees.get('basePrice'))
+    total = _amount(fees.get('totalPrice'))
+    if base is not None:
+        fields['base_price'] = base
+    if total is not None:
+        fields['total_price_all_passengers'] = total
+    return fields
+
+
+def _baggage_policy_links(legs: list[dict], airlines: dict) -> list[dict]:
+    """One baggage-policy link per airline flown in this itinerary, in flight order."""
+    links: list[dict] = []
+    seen: set[str] = set()
+    for leg in legs:
+        for seg in leg.get('segments') or []:
+            code = seg.get('airline_code') or ''
+            if not code or code in seen:
+                continue
+            seen.add(code)
+            url = ((airlines.get(code) or {}).get('airlineFeeUrl') or {}).get('url')
+            if url:
+                links.append({'airline_code': code, 'airline_name': seg.get('airline_name') or code, 'url': url})
+    return links
 
 
 class MomondoSpider(scrapy.Spider):
@@ -152,6 +230,8 @@ class MomondoSpider(scrapy.Spider):
     # None, not the spider instance, so instance attribute reads are impossible).
     auth_failed: bool = False
     crawl_failed: bool = False
+    no_matches: bool = False  # fares existed but none passed the user's cabin/maxStops filters
+    no_flights: bool = False  # Momondo finished the search and had no fares at all
 
     def __init__(
         self,
@@ -169,7 +249,8 @@ class MomondoSpider(scrapy.Spider):
         currency: str = 'USD',
         max_stops: int | None = None,
         max_results: int = 50,
-        proxy_configuration: dict | None = None,
+        checked_bags: int = 0,
+        carry_on_bag: bool = False,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -188,17 +269,21 @@ class MomondoSpider(scrapy.Spider):
         self.currency = currency
         self.max_stops = int(max_stops) if max_stops is not None else None
         self.max_results = int(max_results)
-        self.proxy_configuration = proxy_configuration
+        self.checked_bags = max(0, min(2, int(checked_bags or 0)))
+        self.carry_on_bag = bool(carry_on_bag)
 
         # State
         self.csrf_token: str = ''
-        self._session_refreshed: bool = False
+        self._session_refreshes: int = 0
         self.items_yielded: int = 0
+        self._items_per_flex_date: dict[str, int] = {}
         self.skipped_filtered: int = 0  # results dropped by client-side cabin/stops filters
         # Reset class-level flags so a new spider instance in the same process
         # starts clean (class attributes persist between runs otherwise).
         type(self).auth_failed = False
         type(self).crawl_failed = False
+        type(self).no_matches = False
+        type(self).no_flights = False
         self.observed_filtered_count: int = 0  # highest filteredCount seen across all poll responses
 
         # Validate: flexible mode requires departureDateFlexDays.
@@ -241,53 +326,40 @@ class MomondoSpider(scrapy.Spider):
             date=self.departure_date,
         )
 
+    async def start(self):
+        """Scrapy >= 2.13 entry point (2.19 no longer falls back to start_requests())."""
+        for request in self.start_requests():
+            yield request
+
     def start_requests(self) -> Generator[Request, None, None]:
-        """Fire the bootstrap GET to the flight-search results page.
+        """Open the flight-search results page in the browser session.
 
         This page:
-          - Seeds session cookies (Apache, cluster, p1.med.sid, mst_*, csid, etc.)
+          - Starts the browser session (cookies live in the browser, see src/browser.py)
           - Embeds the CSRF token as: window.R9.formToken = '<value>';
 
         Currency handling:
           The Momondo poll API does NOT accept a currency field in the POST body
-          (QA-confirmed 2026-05-14: causes HTTP 400 VALIDATION_ERROR).
-          We attempt to influence currency by sending it as a cookie on the
-          bootstrap GET — Momondo's UI persists currency selection via cookies.
-          Two cookie names are tried (both observed in UI traffic):
-            - currency=<code>
-            - kyk_curr=<code>
-          If Momondo ignores these cookies, prices are returned in the default
-          currency (usually USD). In that case, a warning is logged in parse_poll
-          and prices are passed through as-is. The currency input parameter is
-          kept for forward compatibility.
+          (QA-confirmed 2026-05-14: causes HTTP 400 VALIDATION_ERROR). The browser
+          context sets currency=<code> and kyk_curr=<code> cookies before opening
+          the page; if Momondo ignores them, prices come back in the default
+          currency (usually USD) and a warning is logged in parse_poll.
 
         The formToken is then extracted in parse_bootstrap() and used as
         the x-csrf header on all poll POST requests.
         """
         bootstrap_url = self._bootstrap_url()
         logger.info(
-            'Starting bootstrap GET to %s (trip_type=%s, currency=%s)',
+            'Starting the Momondo search: %s (trip type %s, currency %s)',
             bootstrap_url,
             self.trip_type,
             self.currency,
         )
-        # Build currency cookie string (best-effort: may not affect API pricing)
-        currency_cookie = f'currency={self.currency}; kyk_curr={self.currency}'
-
         yield scrapy.Request(
             url=bootstrap_url,
             callback=self.parse_bootstrap,
             errback=self.errback_bootstrap,
-            meta={
-                'phase': 'bootstrap',
-                # Use a standard browser Accept header for the bootstrap GET (HTML page)
-                'accept_html': True,
-            },
-            headers={
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Cookie': currency_cookie,
-            },
+            meta={'phase': 'bootstrap', 'browser': 'navigate'},
             dont_filter=True,
         )
 
@@ -303,23 +375,21 @@ class MomondoSpider(scrapy.Spider):
         match = _FORM_TOKEN_RE.search(response.text)
         if match:
             self.csrf_token = match.group(1)
-            logger.info(
+            logger.debug(
                 'Bootstrap complete: formToken extracted (len=%d). '
                 'Firing initial poll request(s).',
                 len(self.csrf_token),
             )
         else:
-            logger.warning(
-                'Bootstrap: window.R9.formToken not found in page HTML. '
-                'Proceeding with empty CSRF token — expect 401 on first poll.'
-            )
+            logger.warning('The search session is not ready; Momondo may refuse the search.')
             self.csrf_token = ''
 
         yield from self._build_poll_requests()
 
     def errback_bootstrap(self, failure: Any) -> None:
-        """Handle bootstrap GET failure."""
-        logger.error('Bootstrap GET failed: %s', failure)
+        """Handle a search page that never opened a session (bot wall, timeout, browser error)."""
+        logger.error('Momondo did not open the search (%s).', failure.getErrorMessage())
+        type(self).crawl_failed = True
 
     # ------------------------------------------------------------------
     # Step 2 — Poll requests (build payloads for each search target)
@@ -349,7 +419,7 @@ class MomondoSpider(scrapy.Spider):
         dates = [base_date + timedelta(days=offset) for offset in range(-n, n + 1)]
 
         logger.info(
-            'Flexible search: fanning out %d date variants (%s to %s) for %s→%s',
+            'Flexible search: %d dates (%s to %s) for %s→%s',
             len(dates),
             dates[0].isoformat(),
             dates[-1].isoformat(),
@@ -406,12 +476,16 @@ class MomondoSpider(scrapy.Spider):
 
         raise ValueError(f'Unknown tripType: {self.trip_type!r}')
 
-    @staticmethod
-    def _leg(origin: str, destination: str, dep_date: str) -> dict:
-        """Construct a single leg dict in Momondo's expected format."""
+    def _leg(self, origin: str, destination: str, dep_date: str) -> dict:
+        """Construct a single leg dict in Momondo's expected format.
+
+        The cabin goes on each leg (legs[].cabinClass), as the site sends it; the
+        userSearchParams-level cabinClass is the field the API rejects.
+        """
         return {
             'origin': {'airports': [origin], 'locationType': 'airports'},
             'destination': {'airports': [destination], 'locationType': 'airports'},
+            'cabinClass': _CABIN_PARAM.get(self.cabin_class, 'economy'),
             'date': dep_date,
             'flex': 'exact',  # API always uses "exact"; flexible = fan-out (see _build_flexible_poll_requests)
         }
@@ -426,18 +500,29 @@ class MomondoSpider(scrapy.Spider):
         passenger_details: list[dict] = [{'ptc': ptc} for ptc in passengers]
         return passengers, passenger_details
 
+    def _bag_filter(self) -> str:
+        """Momondo's fee-assistant filter string, e.g. 'cfc=1;bfc=2' (empty = no bags).
+
+        Same value the site puts in its URL (?fs=bfc=1) and poll body. With it,
+        Momondo returns only fares whose bag cost is known and prices them with the bags.
+        """
+        parts = []
+        if self.carry_on_bag:
+            parts.append('cfc=1')
+        if self.checked_bags:
+            parts.append(f'bfc={self.checked_bags}')
+        return ';'.join(parts)
+
     def _build_filter_params(self) -> dict:
         """Build the filterParams section of the poll body.
 
-        QA-confirmed 2026-05-14: the Momondo poll API rejects ALL filter-specific
-        keys in filterParams with HTTP 400 VALIDATION_ERROR.  In particular:
-          - filterParams.stops → rejected
-          - filterParams.cabin → rejected
-
-        maxStops filtering is applied client-side in parse_result() instead.
-        This method returns an empty dict to avoid 400 errors.
+        Structured filter keys are rejected with HTTP 400 VALIDATION_ERROR
+        (QA-confirmed 2026-05-14: filterParams.stops, filterParams.cabin), so maxStops
+        and cabin filtering stay client-side in parse_result(). The site's own filter
+        string `fs` IS accepted (verified 2026-10-15) and carries the bag selection.
         """
-        return {}
+        bag_filter = self._bag_filter()
+        return {'fs': bag_filter} if bag_filter else {}
 
     def _build_poll_body(self, legs: list[dict], page: int, search_id: str | None = None) -> dict:
         """Construct the full poll request body.
@@ -486,6 +571,8 @@ class MomondoSpider(scrapy.Spider):
         search_id: str | None = None,
         cb_kwargs: dict | None = None,
         page1_retry_count: int = 0,
+        delay_seconds: float = 0,
+        phase_polls: int = 0,
     ) -> Request:
         """Create a single poll POST Request object.
 
@@ -499,6 +586,9 @@ class MomondoSpider(scrapy.Spider):
             cb_kwargs:         Additional cb_kwargs to merge (e.g. for retry context).
             page1_retry_count: Number of page-1 retries already done for this session
                                (for the empty-first-page long-polling pattern).
+            delay_seconds:     Non-blocking wait before sending (applied by the browser
+                               middleware; never time.sleep — it would stall the browser).
+            phase_polls:       Page-1 re-polls already made while the search was incomplete.
         """
         body = self._build_poll_body(legs=legs, page=page, search_id=search_id)
         extra_kwargs = dict(cb_kwargs or {})
@@ -508,6 +598,7 @@ class MomondoSpider(scrapy.Spider):
             'flex_date': flex_date,
             'search_id': search_id,
             'page1_retry_count': page1_retry_count,
+            'phase_polls': phase_polls,
         })
 
         return scrapy.Request(
@@ -522,6 +613,7 @@ class MomondoSpider(scrapy.Spider):
             callback=self.parse_poll,
             errback=self.errback_poll,
             cb_kwargs=extra_kwargs,
+            meta={'handle_httpstatus_list': _POLL_HANDLED_STATUSES, **({'delay_seconds': delay_seconds} if delay_seconds else {})},
             dont_filter=True,
         )
 
@@ -537,6 +629,7 @@ class MomondoSpider(scrapy.Spider):
         flex_date: str | None = None,
         search_id: str | None = None,
         page1_retry_count: int = 0,
+        phase_polls: int = 0,
         **kwargs: Any,
     ) -> Generator[Any, None, None]:
         """Handle a poll response.
@@ -557,23 +650,25 @@ class MomondoSpider(scrapy.Spider):
 
         if response.status == 429:
             logger.warning(
-                'HTTP 429 on poll (page=%d, flex_date=%s). Rate-limited.',
+                'Momondo is rate-limiting the search (page %d, date %s).',
                 page, flex_date,
             )
             # TODO: implement retry with back-off if this becomes frequent in production
             return
 
         if response.status == 403:
-            logger.error(
-                'HTTP 403 on poll. Momondo may be blocking datacenter IPs. '
-                'Consider enabling proxyConfiguration in actor input.'
-            )
+            if 'BOT_CAPTCHA' in response.text:
+                yield from self._handle_401(response, legs=legs, page=page, flex_date=flex_date,
+                                            search_id=search_id, reason='bot captcha')
+                return
+            logger.error('Momondo refused the search (HTTP 403).')
+            logger.debug('403 body: %s', response.text[:200])
             type(self).crawl_failed = True
             return
 
         if response.status != 200:
             logger.error(
-                'Unexpected status %d on poll (page=%d). Skipping page.',
+                'Momondo returned HTTP %d (page %d); skipping it.',
                 response.status, page,
             )
             type(self).crawl_failed = True
@@ -586,11 +681,8 @@ class MomondoSpider(scrapy.Spider):
         try:
             data = response.json()
         except Exception as exc:
-            logger.error(
-                'JSON decode failure on poll page %d (flex_date=%s): %s. '
-                'Raw (first 200 chars): %r',
-                page, flex_date, exc, response.text[:200],
-            )
+            logger.error('Momondo returned an unreadable response (page %d); skipping it.', page)
+            logger.debug('Decode error %s; body: %r', exc, response.text[:200])
             return
 
         results = data.get('results') or []
@@ -601,7 +693,7 @@ class MomondoSpider(scrapy.Spider):
         # --- Capture server-issued searchId (on first response for this session) ---
         server_search_id = data.get('searchId')
         if server_search_id and search_id is None:
-            logger.info(
+            logger.debug(
                 'Captured server-issued searchId=%r for session (flex_date=%s).',
                 server_search_id, flex_date,
             )
@@ -625,20 +717,48 @@ class MomondoSpider(scrapy.Spider):
             first_result = results[0]
             first_bos = first_result.get('bookingOptions') or []
             if first_bos:
-                response_currency = first_bos[0].get('currency') or ''
+                response_currency = (first_bos[0].get('displayPrice') or {}).get('currency') or first_bos[0].get('currency') or ''
                 if response_currency and response_currency.upper() != self.currency.upper():
                     logger.warning(
-                        'Currency mismatch: requested=%r but API returned currency=%r. '
-                        'Momondo may not honour the currency cookie for this session. '
-                        'Prices are returned in %r.',
-                        self.currency, response_currency, response_currency,
+                        'Requested currency %r but Momondo returned prices in %r.',
+                        self.currency, response_currency,
                     )
 
-        logger.info(
+        logger.debug(
             'Poll page %d: %d results returned, filteredCount=%d, '
             'pageSize=%d, flex_date=%s, searchId=%r',
             current_page, len(results), filtered_count, page_size, flex_date, search_id,
         )
+
+        # --- Wait for the search to finish before emitting page 1 ---
+        # Momondo streams providers in phases ("first-phase" ... "complete"); emitting the
+        # first batch returns ~10% of fares and misses late, often cheaper, providers.
+        # A missing status (older responses / fixtures) is treated as complete.
+        search_status = data.get('status')
+        if page == 1 and search_status and search_status != 'complete':
+            if phase_polls < _MAX_PHASE_POLLS:
+                yield self._make_poll_request(
+                    legs=legs,
+                    page=1,
+                    flex_date=flex_date,
+                    search_id=search_id,
+                    page1_retry_count=page1_retry_count,
+                    delay_seconds=_PHASE_POLL_DELAY_SECONDS,
+                    phase_polls=phase_polls + 1,
+                )
+                return
+            logger.warning(
+                'Momondo had not finished searching after %d checks; returning the flights found so far%s.',
+                phase_polls, f' for {flex_date}' if flex_date else '',
+            )
+
+        if page == 1 and search_status == 'complete' and not results and not filtered_count:
+            logger.info('Momondo finished the search and found no flights%s.', f' for {flex_date}' if flex_date else '')
+            type(self).no_flights = True
+            return
+
+        if page == 1 and results:
+            logger.info('Momondo found %d flights%s.', filtered_count, f' for {flex_date}' if flex_date else '')
 
         # --- Long-poll retry: page 1 returned 0 results ---
         # Retry regardless of filteredCount value.
@@ -654,64 +774,56 @@ class MomondoSpider(scrapy.Spider):
                 # Exponential backoff: index into _RETRY_BACKOFF_SECONDS; cap at last value.
                 backoff_idx = min(page1_retry_count, len(_RETRY_BACKOFF_SECONDS) - 1)
                 delay = _RETRY_BACKOFF_SECONDS[backoff_idx]
-                logger.info(
+                logger.debug(
                     'Page 1 empty (filteredCount=%d). Long-poll retry %d/%d after %ds '
                     '(flex_date=%s, searchId=%r).',
                     filtered_count, page1_retry_count + 1, _EMPTY_FIRST_PAGE_MAX_RETRIES,
                     delay, flex_date, search_id,
                 )
-                import time as _time
-                _time.sleep(delay)
                 yield self._make_poll_request(
                     legs=legs,
                     page=1,
                     flex_date=flex_date,
                     search_id=search_id,
                     page1_retry_count=page1_retry_count + 1,
+                    delay_seconds=delay,
                 )
             else:
                 logger.error(
-                    'Page 1 still empty after %d retries (filteredCount=%d, flex_date=%s). '
-                    'Giving up on this session — marking crawl_failed.',
-                    _EMPTY_FIRST_PAGE_MAX_RETRIES, filtered_count, flex_date,
+                    'Momondo returned no flights after %d checks%s.',
+                    _EMPTY_FIRST_PAGE_MAX_RETRIES, f' for {flex_date}' if flex_date else '',
                 )
                 type(self).crawl_failed = True
             return
 
         if not results:
-            logger.info('No results on page %d (flex_date=%s) — stopping pagination.', page, flex_date)
+            logger.debug('No results on page %d (flex_date=%s) — stopping pagination.', page, flex_date)
             return
 
         # --- Yield each result to parse_result ---
         # items_yielded is incremented ONLY when an item is actually yielded
         # (parse_result may yield 0 items if client-side filters drop the result).
         for raw_result in results:
-            if self.items_yielded >= self.max_results:
-                logger.info(
-                    'max_results=%d reached — stopping after %d items.',
-                    self.max_results, self.items_yielded,
-                )
+            if self._quota_reached(flex_date):
                 return
             for item in self.parse_result(raw_result=raw_result, full_response=data):
                 yield item
                 self.items_yielded += 1
-                if self.items_yielded >= self.max_results:
-                    logger.info(
-                        'max_results=%d reached — stopping after %d items.',
-                        self.max_results, self.items_yielded,
-                    )
+                if flex_date:
+                    self._items_per_flex_date[flex_date] = self._items_per_flex_date.get(flex_date, 0) + 1
+                if self._quota_reached(flex_date):
                     return
 
         # --- Pagination: fire next page if more results exist ---
         # Continue paginating even when client-side filtering has reduced our
         # yield count, until we reach max_results OR pagination is exhausted.
-        if self.items_yielded >= self.max_results:
+        if self._quota_reached(flex_date):
             return
 
         results_fetched = current_page * page_size
         if results_fetched < filtered_count:
             next_page = current_page + 1
-            logger.info(
+            logger.debug(
                 'Paginating: fetched=%d < filtered=%d → requesting page %d '
                 '(flex_date=%s, searchId=%r)',
                 results_fetched, filtered_count, next_page, flex_date, search_id,
@@ -722,6 +834,23 @@ class MomondoSpider(scrapy.Spider):
                 flex_date=flex_date,
                 search_id=search_id,
             )
+
+    def _quota_reached(self, flex_date: str | None) -> bool:
+        """True once max_results is reached — or, in flexible mode, this date's even share of it.
+
+        Without the per-date share the first date to finish fills the whole quota and
+        the other dates of a flexible search never reach the output.
+        """
+        if self.items_yielded >= self.max_results:
+            logger.info('Reached maxResults (%d).', self.max_results)
+            return True
+        if flex_date and self._items_per_flex_date.get(flex_date, 0) >= self._flex_date_quota():
+            return True
+        return False
+
+    def _flex_date_quota(self) -> int:
+        dates = 2 * (self.departure_date_flex_days or 1) + 1
+        return -(-self.max_results // dates)  # ceil
 
     def _extract_csrf_from_response(self, response: Response) -> None:
         """No-op: CSRF token is now extracted during bootstrap from page HTML.
@@ -742,36 +871,32 @@ class MomondoSpider(scrapy.Spider):
         page: int,
         flex_date: str | None,
         search_id: str | None = None,
+        reason: str = 'session expired',
     ) -> Generator[Request, None, None]:
-        """Handle HTTP 401: attempt one session refresh, then fail permanently."""
-        if self._session_refreshed:
-            logger.error(
-                'HTTP 401 persists after session refresh. Closing spider as auth_failed.'
-            )
+        """Re-open the search page in a fresh browser session and retry the poll (bounded)."""
+        if self._session_refreshes >= _MAX_SESSION_REFRESHES:
+            logger.error('Momondo still refuses the search after %d retries. Stopping.', self._session_refreshes)
+            logger.debug('Last refusal: %s', reason)
             type(self).auth_failed = True
             raise CloseSpider('auth_failed')
 
-        logger.warning(
-            'HTTP 401 on poll — session expired. Re-running bootstrap to refresh cookies + formToken.'
-        )
-        self._session_refreshed = True
+        self._session_refreshes += 1
+        logger.warning('Momondo refused the search; retrying (%d/%d).', self._session_refreshes, _MAX_SESSION_REFRESHES)
+        logger.debug('Refusal: %s', reason)
         self.csrf_token = ''  # Force re-extraction during next bootstrap.
+        if page == 1:
+            search_id = None  # the old searchId belongs to the discarded session
 
-        # Retry this exact poll request after bootstrap completes.
-        # Pass search_id through so session state is preserved across the 401 refresh.
-        retry_request = self._make_poll_request(
-            legs=legs, page=page, flex_date=flex_date, search_id=search_id
-        )
+        # Retry this poll after the new session opens. Only JSON-safe values go in meta:
+        # the Apify scheduler serialises meta through the request queue, so a Request
+        # object stored there would not survive the round trip.
+        retry = {'legs': legs, 'page': page, 'flex_date': flex_date, 'search_id': search_id}
         bootstrap_url = self._bootstrap_url()
         yield scrapy.Request(
             url=bootstrap_url,
             callback=self.parse_bootstrap_refresh,
             errback=self.errback_bootstrap,
-            meta={'phase': 'bootstrap_refresh', 'retry_request': retry_request},
-            headers={
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.9',
-            },
+            meta={'phase': 'bootstrap_refresh', 'browser': 'navigate', 'retry_poll': retry},
             dont_filter=True,
         )
 
@@ -781,24 +906,18 @@ class MomondoSpider(scrapy.Spider):
         Re-extracts the formToken from the refreshed page, then fires the
         retry request that was stored in meta.
         """
-        logger.info('Session refresh bootstrap complete (status=%d).', response.status)
+        logger.debug('Session refresh bootstrap complete (status=%d).', response.status)
         match = _FORM_TOKEN_RE.search(response.text)
         if match:
             self.csrf_token = match.group(1)
-            logger.info('Refreshed formToken extracted (len=%d).', len(self.csrf_token))
+            logger.debug('Refreshed formToken extracted (len=%d).', len(self.csrf_token))
         else:
-            logger.warning('formToken not found in refresh bootstrap response.')
+            logger.debug('formToken not found in refresh bootstrap response.')
 
-        retry_request = response.meta.get('retry_request')
-        if retry_request:
-            # Update the x-csrf header on the retry request with the new token.
-            retry_request = retry_request.replace(
-                headers={
-                    **dict(retry_request.headers),
-                    'x-csrf': self.csrf_token,
-                }
-            )
-            yield retry_request
+        retry = response.meta.get('retry_poll')
+        if retry:
+            # Built now, so it carries the refreshed x-csrf token.
+            yield self._make_poll_request(**retry)
 
     def errback_poll(self, failure: Any) -> None:
         """Handle network-level errors and HTTP error responses on poll requests.
@@ -815,30 +934,21 @@ class MomondoSpider(scrapy.Spider):
             status = response.status
             # 401 has its own session-refresh path; don't mark crawl_failed for it.
             if status == 401:
-                logger.warning(
-                    'HTTP 401 on poll (errback path) — session refresh not possible from errback. '
-                    'The request will be retried when parse_poll handles it (if HttpErrorMiddleware '
-                    'passes it through). Marking crawl_failed.'
-                )
+                logger.error('Momondo refused the search (HTTP 401).')
                 type(self).crawl_failed = True
             elif 400 <= status < 500:
                 try:
                     body_preview = response.text[:500]
                 except Exception:
                     body_preview = '<unreadable>'
-                logger.error(
-                    'HTTP %d on poll request — Momondo rejected the request body. '
-                    'Body preview: %s. Setting crawl_failed=True.',
-                    status, body_preview,
-                )
+                logger.error('Momondo refused the search (HTTP %d).', status)
+                logger.debug('Response body: %s', body_preview)
                 type(self).crawl_failed = True
             else:
-                logger.error(
-                    'HTTP %d on poll request. Setting crawl_failed=True.', status
-                )
+                logger.error('Momondo returned HTTP %d.', status)
                 type(self).crawl_failed = True
         else:
-            logger.error('Poll request failed with network error: %s', failure)
+            logger.error('Network error while searching Momondo: %s', failure.getErrorMessage())
             type(self).crawl_failed = True
 
     def closed(self, reason: str) -> None:
@@ -848,9 +958,15 @@ class MomondoSpider(scrapy.Spider):
             and self.observed_filtered_count > 0
             and not self.auth_failed
         ):
+            if self.skipped_filtered:
+                logger.warning(
+                    'Momondo found %d fares, but none matched the cabin class / maximum stops filters.',
+                    self.observed_filtered_count,
+                )
+                type(self).no_matches = True
+                return
             logger.error(
-                'Spider closed with 0 items yielded but observed filteredCount=%d on at least '
-                'one response. Results existed but were not extracted — marking crawl_failed=True.',
+                'Momondo reported %d flights, but none could be read from its response.',
                 self.observed_filtered_count,
             )
             type(self).crawl_failed = True
@@ -930,7 +1046,7 @@ class MomondoSpider(scrapy.Spider):
 
             leg_obj = legs_data.get(leg_id)
             if not leg_obj:
-                logger.warning(
+                logger.debug(
                     'Leg %r not found in top-level legs dict for result %s. Skipping leg.',
                     leg_id, result_id,
                 )
@@ -953,7 +1069,7 @@ class MomondoSpider(scrapy.Spider):
 
                 seg_obj = segments_data.get(seg_id)
                 if not seg_obj:
-                    logger.warning(
+                    logger.debug(
                         'Segment %r not found for leg %r in result %s. Skipping segment.',
                         seg_id, leg_id, result_id,
                     )
@@ -1022,7 +1138,7 @@ class MomondoSpider(scrapy.Spider):
             legs_list.append(leg_dict)
 
         if not legs_list:
-            logger.warning('No valid legs assembled for result %s. Skipping.', result_id)
+            logger.debug('No valid legs assembled for result %s. Skipping.', result_id)
             return
 
         # ----------------------------------------------------------------
@@ -1061,7 +1177,9 @@ class MomondoSpider(scrapy.Spider):
             # Price from displayPrice dict
             display_price = bo.get('displayPrice') or {}
             price = display_price.get('price') or 0
-            currency = bo.get('currency') or display_price.get('currency') or ''
+            # displayPrice.currency is the currency of `price`; the top-level bo.currency
+            # can differ (provider's own currency) once a display currency is selected.
+            currency = display_price.get('currency') or bo.get('currency') or ''
 
             # Cabin class: legFarings[0].segmentFarings[0].cabinDisplay
             cabin_class = ''
@@ -1079,6 +1197,7 @@ class MomondoSpider(scrapy.Spider):
                 'booking_url': booking_url,
                 'cabin_class': cabin_class,
             }
+            bo_dict.update(_fee_fields(bo.get('fees')))
             booking_options_list.append(bo_dict)
 
         # ----------------------------------------------------------------
@@ -1092,6 +1211,9 @@ class MomondoSpider(scrapy.Spider):
                 bo for bo in booking_options_list
                 if _cabin_matches(bo.get('cabin_class', ''), self.cabin_class)
             ]
+            # Only the booking options in the requested cabin are returned, so a Business
+            # search does not list the same flight's Economy fares.
+            booking_options_list = matching
             if not matching:
                 logger.debug(
                     'Dropping result %s — no booking options match cabin_class=%r.',
@@ -1123,4 +1245,7 @@ class MomondoSpider(scrapy.Spider):
         loader.add_value('booking_options', booking_options_list or [])
         loader.add_value('scraped_at', datetime.now(timezone.utc).isoformat())
 
-        yield loader.load_item()
+        item = loader.load_item()
+        item['bags_requested'] = {'checked_bags': self.checked_bags, 'carry_on_bag': self.carry_on_bag}
+        item['baggage_policy_links'] = _baggage_policy_links(legs_list, full_response.get('airlines') or {})
+        yield item

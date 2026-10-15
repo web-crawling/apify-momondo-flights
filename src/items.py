@@ -29,5 +29,9 @@ class FlightItem(scrapy.Item):
     legs = scrapy.Field()               # list[dict]: per-leg details; see architecture for shape
     booking_options = scrapy.Field()    # list[dict]: booking partner options with prices + URLs
 
+    # ---------- baggage ----------
+    bags_requested = scrapy.Field()        # dict: {"checked_bags": int, "carry_on_bag": bool} priced into "price"
+    baggage_policy_links = scrapy.Field()  # list[dict]: per-airline baggage/fee policy page
+
     # ---------- metadata ----------
     scraped_at = scrapy.Field()         # str: UTC ISO 8601 collection timestamp

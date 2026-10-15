@@ -5,6 +5,8 @@ Processes the Actor's input, validates it, and executes the MomondoSpider.
 
 from __future__ import annotations
 
+from datetime import date, timedelta
+
 from apify import Actor
 from apify.scrapy import apply_apify_settings
 from scrapy.crawler import CrawlerRunner
@@ -18,9 +20,46 @@ VALID_TRIP_TYPES = {'one-way', 'round-trip', 'multi-city', 'flexible'}
 # Valid cabin class values.
 VALID_CABIN_CLASSES = {'ECONOMY', 'PREMIUM_ECONOMY', 'BUSINESS', 'FIRST'}
 
+# Search date used when departureDate is left empty (keeps the daily Store test on a future date).
+DEFAULT_DAYS_AHEAD = 30
+
+
+def _past_date(value: str) -> str | None:
+    """Return an error message when value is not a valid YYYY-MM-DD date of today or later."""
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError:
+        return f'{value!r} is not a valid date (use YYYY-MM-DD).'
+    if parsed < date.today():
+        return f'{value} is in the past. Use today or a later date.'
+    return None
+
+
+# Process exit code raised by main(). Under Scrapy the SDK does not call sys.exit(),
+# so Actor.fail() alone leaves the process exiting 0 and the run shows SUCCEEDED.
+EXIT_CODE = 0
+
+
+async def _fail(status_message: str) -> None:
+    """Fail the run so the platform actually marks it FAILED."""
+    global EXIT_CODE  # noqa: PLW0603
+    EXIT_CODE = 1
+    await Actor.fail(status_message=status_message)
+
 
 async def main() -> None:
-    """Apify Actor main coroutine for executing the Momondo flights spider."""
+    """Apify Actor main coroutine; exits non-zero when the run failed.
+
+    run_scrapy_actor() drives this through Twisted's react(), which calls sys.exit()
+    itself and maps a SystemExit raised here to the process exit code.
+    """
+    await _run()
+    if EXIT_CODE:
+        raise SystemExit(EXIT_CODE)
+
+
+async def _run() -> None:
+    """Parse the input, run the MomondoSpider and report failures."""
     async with Actor:
         actor_input = await Actor.get_input() or {}
 
@@ -42,14 +81,17 @@ async def main() -> None:
         destination = str(actor_input.get('destination', 'LHR')).strip().upper()
 
         # --- departureDate ---
-        departure_date = str(actor_input.get('departureDate', '2026-08-01')).strip()
+        departure_date = str(actor_input.get('departureDate') or '').strip()
+        if not departure_date:
+            departure_date = (date.today() + timedelta(days=DEFAULT_DAYS_AHEAD)).isoformat()
+            Actor.log.info('No departureDate given — searching %s (%d days from today).', departure_date, DEFAULT_DAYS_AHEAD)
 
         # --- returnDate (required for round-trip) ---
         return_date_raw = actor_input.get('returnDate')
         return_date: str | None = str(return_date_raw).strip() if return_date_raw else None
 
         if trip_type == 'round-trip' and not return_date:
-            await Actor.fail(
+            await _fail(
                 status_message=(
                     'tripType is "round-trip" but returnDate is not set. '
                     'Please provide a returnDate (YYYY-MM-DD).'
@@ -79,7 +121,7 @@ async def main() -> None:
         legs: list[dict] = []
         if trip_type == 'multi-city':
             if not legs_raw:
-                await Actor.fail(
+                await _fail(
                     status_message=(
                         'tripType is "multi-city" but no legs were provided. '
                         'Please supply the "legs" input parameter with at least 2 legs.'
@@ -102,9 +144,22 @@ async def main() -> None:
                     'departureDate': str(leg['departureDate']).strip(),
                 })
             if not legs:
-                await Actor.fail(
+                await _fail(
                     status_message='No valid legs found in the "legs" input. Each leg must have origin, destination, and departureDate.'
                 )
+                return
+
+        # --- every date must be valid and not in the past ---
+        if trip_type == 'multi-city':  # multi-city searches only use the per-leg dates
+            dates_to_check = [(f'Leg {i + 1} departure date', leg['departureDate']) for i, leg in enumerate(legs)]
+        else:
+            dates_to_check = [('Departure date', departure_date)]
+            if trip_type == 'round-trip':
+                dates_to_check.append(('Return date', return_date or ''))
+        for field_name, value in dates_to_check:
+            problem = _past_date(value)
+            if problem:
+                await _fail(status_message=f'{field_name}: {problem}')
                 return
 
         # --- passengers ---
@@ -195,19 +250,28 @@ async def main() -> None:
                 'Invalid maxResults value %r — defaulting to 50.', max_results_raw
             )
 
-        # --- proxyConfiguration ---
-        proxy_configuration = actor_input.get('proxyConfiguration') or None
+        # --- baggage (Momondo fee assistant) ---
+        checked_bags_raw = actor_input.get('checkedBags', 0)
+        try:
+            checked_bags = int(checked_bags_raw or 0)
+        except (ValueError, TypeError):
+            Actor.log.warning('Invalid checkedBags value %r — using 0.', checked_bags_raw)
+            checked_bags = 0
+        if not 0 <= checked_bags <= 2:
+            Actor.log.warning('checkedBags must be 0, 1 or 2; got %r — clamping.', checked_bags)
+            checked_bags = max(0, min(2, checked_bags))
+        carry_on_bag = bool(actor_input.get('carryOnBag', False))
+
 
         Actor.log.info(
             'Actor input parsed: trip_type=%s origin=%s destination=%s '
             'departure_date=%s return_date=%s flex_days=%s '
             'adults=%d children=%d infants=%d cabin=%s currency=%s '
-            'max_stops=%s max_results=%d proxy=%s',
+            'max_stops=%s max_results=%d checked_bags=%d carry_on_bag=%s',
             trip_type, origin, destination,
             departure_date, return_date, departure_date_flex_days,
             adults, children, infants, cabin_class, currency,
-            max_stops, max_results,
-            'configured' if proxy_configuration else 'none',
+            max_stops, max_results, checked_bags, carry_on_bag,
         )
 
         # --- Build Scrapy settings ---
@@ -217,6 +281,8 @@ async def main() -> None:
         # --- Run spider ---
         MomondoSpider.auth_failed = False  # reset before each run
         MomondoSpider.crawl_failed = False  # reset before each run
+        MomondoSpider.no_matches = False  # reset before each run
+        MomondoSpider.no_flights = False  # reset before each run
         crawler_runner = CrawlerRunner(settings)
         crawl_deferred = crawler_runner.crawl(
             MomondoSpider,
@@ -234,7 +300,8 @@ async def main() -> None:
             currency=currency,
             max_stops=max_stops,
             max_results=max_results,
-            proxy_configuration=proxy_configuration,
+            checked_bags=checked_bags,
+            carry_on_bag=carry_on_bag,
         )
         spider = await deferred_to_future(crawl_deferred)
 
@@ -242,10 +309,9 @@ async def main() -> None:
         # Scrapy returns the spider instance from crawl_deferred in some versions;
         # check both the class attribute (set in __init__) and MomondoSpider.auth_failed.
         if MomondoSpider.auth_failed:
-            await Actor.fail(
+            await _fail(
                 status_message=(
-                    'Spider authentication failed. CSRF token or session cookies '
-                    'could not be established. Check logs for details.'
+                    'Momondo refused this search. Please try again in a few minutes.'
                 )
             )
             return
@@ -256,10 +322,22 @@ async def main() -> None:
         # Without this check, Scrapy exits cleanly (SUCCEEDED with 0 items) and the
         # failure is invisible on the Apify platform.
         if MomondoSpider.crawl_failed:
-            await Actor.fail(
+            await _fail(
                 status_message=(
-                    'Spider crawl failed. The poll request was rejected by Momondo '
-                    '(HTTP 4xx/5xx), or the spider exited with 0 items despite '
-                    'Momondo reporting available results. Check logs for details.'
+                    'The search could not be completed on Momondo. Please try again in a few '
+                    'minutes. If it keeps failing, try another date.'
                 )
+            )
+            return
+
+        if MomondoSpider.no_flights and not MomondoSpider.no_matches:
+            await Actor.set_status_message(
+                'Momondo found no flights for this search. With bags selected, only fares '
+                'with a published bag price count. Try another date or fewer bags.'
+            )
+
+        if MomondoSpider.no_matches:
+            await Actor.set_status_message(
+                'Momondo found flights for this route, but none match your cabin class '
+                'or maximum stops. Try relaxing those filters.'
             )
