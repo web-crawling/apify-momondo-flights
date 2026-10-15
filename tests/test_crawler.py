@@ -394,8 +394,8 @@ def test_passenger_build():
 
     spider = MomondoSpider(adults=2, children=1, infants=1)
     passengers, details = spider._build_passengers()
-    assert passengers == ['ADT', 'ADT', 'CNN', 'INF']
-    assert details == [{'ptc': 'ADT'}, {'ptc': 'ADT'}, {'ptc': 'CNN'}, {'ptc': 'INF'}]
+    assert passengers == ['ADT', 'ADT', 'CHD', 'INL']
+    assert details == [{'ptc': 'ADT'}, {'ptc': 'ADT'}, {'ptc': 'CHD'}, {'ptc': 'INL'}]
     print('\n[PASS] Passenger build: correct PTC arrays for 2 adults + 1 child + 1 infant')
 
 

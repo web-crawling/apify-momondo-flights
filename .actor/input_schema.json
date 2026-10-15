@@ -8,7 +8,12 @@
 			"title": "Trip Type",
 			"type": "string",
 			"editor": "select",
-			"enum": ["one-way", "round-trip", "multi-city", "flexible"],
+			"enum": [
+				"one-way",
+				"round-trip",
+				"multi-city",
+				"flexible"
+			],
 			"default": "one-way",
 			"description": "Search mode: 'one-way' for single leg, 'round-trip' for outbound + return, 'multi-city' for multiple stops, 'flexible' for date range search (±N days)."
 		},
@@ -32,8 +37,7 @@
 			"title": "Departure Date",
 			"type": "string",
 			"editor": "textfield",
-			"default": "2026-08-01",
-			"description": "Departure date in YYYY-MM-DD format. Must be today or in the future.",
+			"description": "Departure date (YYYY-MM-DD), today or later. Leave empty to search 30 days from today.",
 			"sectionCaption": "Route"
 		},
 		"returnDate": {
@@ -60,8 +64,16 @@
 			"editor": "json",
 			"description": "Array of flight legs for multi-city trips. Each leg: {origin: string (IATA), destination: string (IATA), departureDate: string (YYYY-MM-DD)}. Minimum 2 legs required. Used only when Trip Type is 'multi-city'.",
 			"prefill": [
-				{"origin": "JFK", "destination": "LHR", "departureDate": "2026-08-01"},
-				{"origin": "LHR", "destination": "CDG", "departureDate": "2026-08-08"}
+				{
+					"origin": "JFK",
+					"destination": "LHR",
+					"departureDate": "2027-03-01"
+				},
+				{
+					"origin": "LHR",
+					"destination": "CDG",
+					"departureDate": "2027-03-08"
+				}
 			],
 			"sectionCaption": "Multi-City Legs"
 		},
@@ -72,7 +84,7 @@
 			"default": 1,
 			"minimum": 1,
 			"maximum": 9,
-			"description": "Number of adult passengers (18+).",
+			"description": "Number of adult passengers. Up to 9 passengers in total.",
 			"sectionCaption": "Passengers"
 		},
 		"children": {
@@ -82,7 +94,7 @@
 			"default": 0,
 			"minimum": 0,
 			"maximum": 8,
-			"description": "Number of child passengers (2–17 years).",
+			"description": "Number of child passengers (2–11 years). Up to 9 passengers in total.",
 			"sectionCaption": "Passengers"
 		},
 		"infants": {
@@ -92,16 +104,21 @@
 			"default": 0,
 			"minimum": 0,
 			"maximum": 4,
-			"description": "Number of infant passengers (under 2 years, lap-held).",
+			"description": "Number of infants under 2, travelling on an adult's lap. Up to 9 passengers in total.",
 			"sectionCaption": "Passengers"
 		},
 		"cabinClass": {
 			"title": "Cabin Class",
 			"type": "string",
 			"editor": "select",
-			"enum": ["ECONOMY", "PREMIUM_ECONOMY", "BUSINESS", "FIRST"],
+			"enum": [
+				"ECONOMY",
+				"PREMIUM_ECONOMY",
+				"BUSINESS",
+				"FIRST"
+			],
 			"default": "ECONOMY",
-			"description": "Cabin class filter (applied client-side; results may be fewer than maxResults).",
+			"description": "Cabin to search on Momondo. Only booking options in this cabin are returned, so you may get fewer than Max Results.",
 			"sectionCaption": "Search Options"
 		},
 		"currency": {
@@ -109,7 +126,7 @@
 			"type": "string",
 			"editor": "textfield",
 			"default": "USD",
-			"description": "ISO 4217 currency code for returned prices (e.g., USD, EUR, GBP). Best-effort: Momondo may ignore non-USD currencies.",
+			"description": "3-letter currency code for all prices, e.g. USD or EUR.",
 			"sectionCaption": "Search Options"
 		},
 		"maxStops": {
@@ -122,6 +139,23 @@
 			"description": "Maximum number of stops. 0 = nonstop only, 1 = max 1 stop, etc. Leave empty for no restriction.",
 			"sectionCaption": "Search Options"
 		},
+		"checkedBags": {
+			"title": "Checked Bags per Passenger",
+			"type": "integer",
+			"editor": "number",
+			"minimum": 0,
+			"maximum": 2,
+			"default": 0,
+			"description": "Price every fare with this many checked bags per passenger (0, 1 or 2), like Momondo's fee filter. When set, only fares whose bag cost is known are returned, and each booking option's price already includes the bag fees. Use 0 for fares without checked bags.",
+			"sectionCaption": "Bags"
+		},
+		"carryOnBag": {
+			"title": "Include Carry-on Bag",
+			"type": "boolean",
+			"editor": "checkbox",
+			"default": false,
+			"description": "Price every fare with one carry-on bag per passenger. When on, only fares whose carry-on cost is known are returned, and the price already includes it."
+		},
 		"maxResults": {
 			"title": "Max Results",
 			"type": "integer",
@@ -131,13 +165,6 @@
 			"maximum": 500,
 			"description": "Maximum number of flight results to return across all pages.",
 			"sectionCaption": "Search Options"
-		},
-		"proxyConfiguration": {
-			"title": "Proxy Configuration",
-			"type": "object",
-			"editor": "proxy",
-			"description": "Apify proxy configuration. By default the actor runs without proxy (direct datacenter requests work on Momondo as of v1). Only configure this if you encounter HTTP 401/429/403 errors.",
-			"sectionCaption": "Advanced"
 		}
 	}
 }

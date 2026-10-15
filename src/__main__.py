@@ -16,6 +16,7 @@ from scrapy.utils.reactor import install_reactor
 # Scrapy components.
 install_reactor('twisted.internet.asyncioreactor.AsyncioSelectorReactor')
 
+import logging
 import os
 
 from apify.scrapy import initialize_logging, run_scrapy_actor
@@ -29,4 +30,7 @@ os.environ['SCRAPY_SETTINGS_MODULE'] = 'src.settings'
 
 if __name__ == '__main__':
     initialize_logging()
+    # The SDK announces its browser-sandbox default on every platform run; the browser here
+    # is launched by Playwright directly, so the warning is noise in the user's log.
+    logging.getLogger('apify._configuration').setLevel(logging.ERROR)
     run_scrapy_actor(main())

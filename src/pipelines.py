@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 from scrapy.exceptions import DropItem
 
 if TYPE_CHECKING:
-    from scrapy import Spider
+    from scrapy.crawler import Crawler
 
 
 class NullStripPipeline:
@@ -24,7 +24,7 @@ class NullStripPipeline:
     makes them absent, which passes schema validation for optional fields.
     """
 
-    def process_item(self, item, spider: Spider):
+    def process_item(self, item):
         null_keys = [k for k, v in item.items() if v is None]
         for key in null_keys:
             del item[key]
@@ -34,13 +34,18 @@ class NullStripPipeline:
 class LimitItemsNumberPipeline:
     """Enforce a hard item count limit via CLOSESPIDER_ITEMCOUNT."""
 
-    def __init__(self):
+    def __init__(self, items_limit: int | None = None):
         self.items_scraped_count = 0
+        self.items_limit = items_limit
 
-    def process_item(self, item, spider: Spider):
+    @classmethod
+    def from_crawler(cls, crawler: Crawler) -> LimitItemsNumberPipeline:
+        return cls(crawler.settings.getint('CLOSESPIDER_ITEMCOUNT') or None)
+
+    def process_item(self, item):
         self.items_scraped_count += 1
 
-        items_limit = spider.settings.get('CLOSESPIDER_ITEMCOUNT')
+        items_limit = self.items_limit
         if items_limit and self.items_scraped_count > items_limit:
             raise DropItem(f'Strict limit reached: Exceeded {items_limit} items.')
 
